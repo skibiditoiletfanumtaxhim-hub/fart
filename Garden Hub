@@ -18,6 +18,7 @@ local character = player.Character or player.CharacterAdded:Wait()
 --==================================================================
 local CONFIG_FOLDER = "AutoHarvestConfigs"
 local DEFAULT_CONFIG_NAME = "default"
+local AUTOLOAD_FILE_PATH = CONFIG_FOLDER .. "/autoload_target.txt"
 
 local function getConfigPath(name)
     return CONFIG_FOLDER .. "/" .. (name or DEFAULT_CONFIG_NAME) .. ".json"
@@ -226,7 +227,8 @@ local function getMyGarden()
 end
 
 local function activateHarvestPrompts()
-	local garden = getMyGarden();  if not garden then return end
+	local garden = getMyGarden();
+	if not garden then return end
 	local plants = garden:FindFirstChild("Plants");  if not plants then return end
 	for _, plant in ipairs(plants:GetChildren()) do
 		if not (enabled and running) then break end
@@ -245,7 +247,8 @@ local function activateHarvestPrompts()
 end
 
 local function activateSeedPackPrompts()
-	local map = Workspace:FindFirstChild("Map");  if not map then return end
+	local map = Workspace:FindFirstChild("Map");
+	if not map then return end
 	local spawns = map:FindFirstChild("SeedPackSpawnServerLocations");  if not spawns then return end
 	for _, obj in ipairs(spawns:GetDescendants()) do
 		if obj:IsA("ProximityPrompt") then firePrompt(obj) end
@@ -253,9 +256,11 @@ local function activateSeedPackPrompts()
 end
 
 local function collectSeedPacks()
-	local map = Workspace:FindFirstChild("Map");  if not map then return end
+	local map = Workspace:FindFirstChild("Map");
+	if not map then return end
 	local spawns = map:FindFirstChild("SeedPackSpawnServerLocations");  if not spawns then return end
-	local hrp = getHRP();  if not hrp then return end
+	local hrp = getHRP();
+	if not hrp then return end
 	for _, obj in ipairs(spawns:GetDescendants()) do
 		if obj:IsA("ProximityPrompt") and obj.Enabled then
 			local part = obj.Parent
@@ -274,10 +279,13 @@ local function collectSeedPacks()
 end
 
 local function getFruitLabel()
-	local pg = player:FindFirstChild("PlayerGui");      if not pg then return nil end
+	local pg = player:FindFirstChild("PlayerGui");
+	if not pg then return nil end
 	local bg = pg:FindFirstChild("BackpackGui");        if not bg then return nil end
-	local bp = bg:FindFirstChild("Backpack");           if not bp then return nil end
-	local inv = bp:FindFirstChild("Inventory");         if not inv then return nil end
+	local bp = bg:FindFirstChild("Backpack");
+	if not bp then return nil end
+	local inv = bp:FindFirstChild("Inventory");
+	if not inv then return nil end
 	return inv:FindFirstChild("FruitInventory")
 end
 
@@ -296,7 +304,8 @@ local function stripVisuals()
 	local removed, disabled, smoothed = 0, 0, 0
 	for _, obj in ipairs(Workspace:GetDescendants()) do
 		if texClasses[obj.ClassName] then
-			pcall(function() obj:Destroy() end); removed += 1
+			pcall(function() obj:Destroy() end);
+			removed += 1
 		elseif particleClasses[obj.ClassName] then
 			pcall(function() obj.Enabled = false end); disabled += 1
 		elseif obj:IsA("BasePart") then
@@ -405,7 +414,7 @@ local function buyAllGear()   buyShop(getGearShopFrame,  Networking.GearShop.Pur
 local function buyAllCrates() buyShop(getCrateShopFrame, Networking.CrateShop.PurchaseCrate, nil); print("[Shop] crates done") end
 
 --==================================================================
--- AUTO PETS (wild pet tame) - CONFIRM REMOTE/ID VIA INSPECTION
+-- AUTO PETS (wild pet tame)
 --==================================================================
 local function findWildPetsFolder()
 	local map = Workspace:FindFirstChild("Map")
@@ -420,30 +429,25 @@ end
 
 local function petMatchesFilters(model)
 	local name = petInfo(model)
-	if next(selectedPetNames) == nil then return true end  -- nothing ticked = all
+	if next(selectedPetNames) == nil then return true end
 	return selectedPetNames[name] == true
 end
 
 local function tameWildPet(model)
-	-- Wrap the whole thing in a spawn function so it runs in the background 
-	-- and doesn't freeze or block your main script loop!
-	spawn(function()
-		-- Wait up to 2 seconds for the parts to exist
+	task.spawn(function()
 		local rootPart = model:WaitForChild("RootPart", 2)
 		if not rootPart then return end
 
 		local buyPrompt = rootPart:WaitForChild("BuyPrompt", 2)
 		if not buyPrompt or not buyPrompt:IsA("ProximityPrompt") then return end
 
-		-- Small delay to let the game server register your position
-		wait(0.15)
+		task.wait(0.15)
 
-		-- Fire the prompt
 		if fireproximityprompt then
 			fireproximityprompt(buyPrompt)
 		else
 			buyPrompt:InputHoldBegin()
-			wait(buyPrompt.HoldDuration + 0.05)
+			task.wait(buyPrompt.HoldDuration + 0.05)
 			buyPrompt:InputHoldEnd()
 		end
 	end)
@@ -542,7 +546,7 @@ end)
 -- UI LIBRARY (dark, animated, accented)
 --==================================================================
 local Theme = {
-	BG       = Color3.fromRGB(18, 18, 22),
+	BG        = Color3.fromRGB(18, 18, 22),
 	Header   = Color3.fromRGB(24, 24, 30),
 	Panel    = Color3.fromRGB(22, 22, 27),
 	Row      = Color3.fromRGB(30, 30, 37),
@@ -622,7 +626,7 @@ function Library.new(title)
 	header.Size             = UDim2.new(1, 0, 0, 46)
 	header.BackgroundColor3 = Theme.Header
 	header.BorderSizePixel  = 0
-	header.Parent           = main
+	header.Parent          = main
 	gradient(header, Theme.Header, Color3.fromRGB(30, 22, 24), 25)
 
 	local accentBar = Instance.new("Frame")
@@ -637,7 +641,7 @@ function Library.new(title)
 	titleLbl.Size             = UDim2.new(1, -130, 1, 0)
 	titleLbl.Position         = UDim2.fromOffset(18, 0)
 	titleLbl.BackgroundTransparency = 1
-	titleLbl.Font             = Enum.Font.GothamBold
+	titleLbl.Font              = Enum.Font.GothamBold
 	titleLbl.TextSize         = 17
 	titleLbl.TextColor3       = Theme.Text
 	titleLbl.TextXAlignment   = Enum.TextXAlignment.Left
@@ -688,7 +692,7 @@ function Library.new(title)
 
 	content = Instance.new("Frame")
 	content.Size             = UDim2.new(1, -20, 1, -100)
-	content.Position         = UDim2.fromOffset(10, 94)
+	content.Position        = UDim2.fromOffset(10, 94)
 	content.BackgroundColor3 = Theme.Panel
 	content.BorderSizePixel  = 0
 	content.Parent           = main
@@ -735,7 +739,7 @@ function Library:AddTab(name)
 	btn.AutoButtonColor  = false
 	btn.Font             = Enum.Font.GothamSemibold
 	btn.TextSize         = 13
-	btn.TextColor3       = Theme.SubText
+	btn.TextColor3        = Theme.SubText
 	btn.Text             = name
 	btn.Parent           = self.tabBar
 	corner(btn, 7)
@@ -788,7 +792,7 @@ function Library:AddToggle(tab, text, default, onChanged)
 	holder.Size             = UDim2.new(1, 0, 0, 42)
 	holder.BackgroundColor3 = Theme.Row
 	holder.BorderSizePixel  = 0
-	holder.AutoButtonColor  = false
+	holder.AutoButtonColor   = false
 	holder.Font             = Enum.Font.GothamSemibold
 	holder.TextSize         = 14
 	holder.TextColor3       = Theme.Text
@@ -801,7 +805,7 @@ function Library:AddToggle(tab, text, default, onChanged)
 	track(holder.MouseLeave:Connect(function() tw(holder, TW_FAST, { BackgroundColor3 = Theme.Row }) end))
 
 	local pill = Instance.new("Frame")
-	pill.Size             = UDim2.fromOffset(44, 22)
+	pill.Size              = UDim2.fromOffset(44, 22)
 	pill.Position         = UDim2.new(1, -56, 0.5, -11)
 	pill.BackgroundColor3 = Theme.Off
 	pill.BorderSizePixel  = 0
@@ -1084,7 +1088,6 @@ end)
 win:AddButton(configTab, "Load Config", function()
 	local name = currentConfigName
 	if loadConfig(name) then
-		-- Update all UI toggles to match loaded state
 		setEnabled(enabled)
 		setAutoSell(AUTO_SELL)
 		setAutoCollect(AUTO_COLLECT)
@@ -1094,11 +1097,23 @@ win:AddButton(configTab, "Load Config", function()
 		setAutoBuySeeds(autoBuySeeds)
 		setAutoBuyGear(autoBuyGear)
 		setAutoBuyCrates(autoBuyCrates)
-		-- Refresh shop checklists
 		buildChecklist(getSeedShopFrame, selectedSeeds, seedRows)
 		buildChecklist(getGearShopFrame, selectedGear, gearRows)
 		buildChecklist(getCrateShopFrame, selectedCrates, crateRows)
 		refreshPetNames()
+	end
+end)
+
+-- NEW AUTOLOAD SELECTION BUTTON
+win:AddButton(configTab, "Set as Autoload", function()
+	ensureConfigFolder()
+	local success, err = pcall(function()
+		writefile(AUTOLOAD_FILE_PATH, currentConfigName)
+	end)
+	if success then
+		print("[Config] '" .. currentConfigName .. "' has been set as the startup config.")
+	else
+		warn("[Config] Failed to set autoload: " .. tostring(err))
 	end
 end)
 
@@ -1123,9 +1138,17 @@ win:AddButton(configTab, "Refresh List", function()
 	refreshConfigList()
 end)
 
--- Auto-load default config on startup
+-- Dynamically check for a saved autoload preference on startup
 pcall(function()
-	if loadConfig(DEFAULT_CONFIG_NAME) then
+	local targetConfig = DEFAULT_CONFIG_NAME
+	if isfile(AUTOLOAD_FILE_PATH) then
+		local savedTarget = readfile(AUTOLOAD_FILE_PATH)
+		if savedTarget and savedTarget ~= "" then
+			targetConfig = savedTarget
+		end
+	end
+
+	if loadConfig(targetConfig) then
 		setEnabled(enabled)
 		setAutoSell(AUTO_SELL)
 		setAutoCollect(AUTO_COLLECT)
@@ -1135,6 +1158,12 @@ pcall(function()
 		setAutoBuySeeds(autoBuySeeds)
 		setAutoBuyGear(autoBuyGear)
 		setAutoBuyCrates(autoBuyCrates)
+		
+		-- Sync the UI Textbox to match what was loaded
+		if configNameBox then
+			configNameBox.Text = targetConfig
+			currentConfigName = targetConfig
+		end
 	end
 end)
 
