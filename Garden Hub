@@ -1,0 +1,898 @@
+-- AutoHarvest + Custom UI (LocalScript)
+-- StarterPlayer > StarterPlayerScripts
+
+local Players                = game:GetService("Players")
+local Workspace              = game:GetService("Workspace")
+local ReplicatedStorage      = game:GetService("ReplicatedStorage")
+local UserInputService       = game:GetService("UserInputService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local VirtualUser            = game:GetService("VirtualUser")
+local TweenService           = game:GetService("TweenService")
+
+local player    = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+
+--==================================================================
+-- LIFECYCLE / CLEANUP
+--==================================================================
+local running     = true
+local connections = {}
+
+local function track(conn)
+	table.insert(connections, conn)
+	return conn
+end
+
+local function unloadEverything()
+	running = false
+	for _, conn in ipairs(connections) do
+		pcall(function() conn:Disconnect() end)
+	end
+	table.clear(connections)
+	local g = player:FindFirstChild("PlayerGui")
+	if g then
+		local existing = g:FindFirstChild("CustomHarvestGui")
+		if existing then existing:Destroy() end
+	end
+	print("[AutoHarvest] Unloaded.")
+end
+
+track(player.CharacterAdded:Connect(function(c)
+	character = c
+end))
+
+--==================================================================
+-- CONFIG / STATE
+--==================================================================
+local LOOP_INTERVAL    = 2
+local DO_HARVEST       = true
+local DO_SEED_PACKS    = true
+local POLL_INTERVAL    = 0.25
+local COLLECT_INTERVAL = 0.4
+local RETURN_TO_START  = true
+local TP_SETTLE        = 0.03
+
+local enabled          = false
+local AUTO_SELL        = false
+local AUTO_COLLECT     = false
+local ANTI_AFK         = false
+local HIDE_OTHER_PLOTS = false
+
+local sweeping   = false
+local collecting = false
+
+local selectedSeeds  = {}
+local selectedGear   = {}
+local selectedCrates = {}
+local autoBuySeeds   = false
+local autoBuyGear    = false
+local autoBuyCrates  = false
+
+local AUTO_PETS        = false
+local selectedPetNames = {}
+local selectedRarities = {}
+
+track(player.Idled:Connect(function()
+	if not (running and ANTI_AFK) then return end
+	VirtualUser:CaptureController()
+	VirtualUser:ClickButton2(Vector2.new())
+end))
+
+local Networking = require(ReplicatedStorage.SharedModules.Networking)
+
+--==================================================================
+-- CORE LOGIC
+--==================================================================
+local function firePrompt(prompt)
+	if not prompt or not prompt:IsA("ProximityPrompt") then return end
+	if not prompt.Enabled then return end
+	if prompt.ActionText == "" and prompt.ObjectText == "" then return end
+	pcall(function()
+		prompt.MaxActivationDistance = math.huge
+		prompt.RequiresLineOfSight   = false
+		prompt.HoldDuration          = 0
+		prompt:InputHoldBegin()
+		prompt:InputHoldEnd()
+	end)
+end
+
+local function getHRP()
+	local char = character or player.Character
+	return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function getMyGarden()
+	local gardens = Workspace:FindFirstChild("Gardens")
+	if not gardens then return nil end
+	for _, model in ipairs(gardens:GetChildren()) do
+		if model:GetAttribute("Owner") == player.Name then return model end
+	end
+	return nil
+end
+
+local function activateHarvestPrompts()
+	local garden = getMyGarden();  if not garden then return end
+	local plants = garden:FindFirstChild("Plants");  if not plants then return end
+	for _, plant in ipairs(plants:GetChildren()) do
+		if not (enabled and running) then break end
+		local plantId = plant:GetAttribute("PlantId")
+		local fruits  = plant:FindFirstChild("Fruits")
+		if plantId and fruits then
+			for _, fruit in ipairs(fruits:GetChildren()) do
+				local fruitId = fruit:GetAttribute("FruitId")
+				if fruitId then
+					pcall(function() Networking.Garden.CollectFruit:Fire(plantId, fruitId) end)
+				end
+			end
+		end
+		task.wait()
+	end
+end
+
+local function activateSeedPackPrompts()
+	local map = Workspace:FindFirstChild("Map");  if not map then return end
+	local spawns = map:FindFirstChild("SeedPackSpawnServerLocations");  if not spawns then return end
+	for _, obj in ipairs(spawns:GetDescendants()) do
+		if obj:IsA("ProximityPrompt") then firePrompt(obj) end
+	end
+end
+
+local function collectSeedPacks()
+	local map = Workspace:FindFirstChild("Map");  if not map then return end
+	local spawns = map:FindFirstChild("SeedPackSpawnServerLocations");  if not spawns then return end
+	local hrp = getHRP();  if not hrp then return end
+	for _, obj in ipairs(spawns:GetDescendants()) do
+		if obj:IsA("ProximityPrompt") and obj.Enabled then
+			local part = obj.Parent
+			if part and part:IsA("BasePart") then
+				local startCFrame = hrp.CFrame
+				hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+				task.wait(TP_SETTLE)
+				firePrompt(obj)
+				if RETURN_TO_START then
+					task.wait(TP_SETTLE)
+					hrp.CFrame = startCFrame
+				end
+			end
+		end
+	end
+end
+
+local function getFruitLabel()
+	local pg = player:FindFirstChild("PlayerGui");      if not pg then return nil end
+	local bg = pg:FindFirstChild("BackpackGui");        if not bg then return nil end
+	local bp = bg:FindFirstChild("Backpack");           if not bp then return nil end
+	local inv = bp:FindFirstChild("Inventory");         if not inv then return nil end
+	return inv:FindFirstChild("FruitInventory")
+end
+
+local function isInventoryFull()
+	local label = getFruitLabel()
+	if not label or not label:IsA("TextLabel") then return false end
+	local clean = label.Text:gsub("<[^>]->", ""):gsub(",", "")
+	local cur, max = string.match(clean, "(%d+)%s*/%s*(%d+)")
+	cur, max = tonumber(cur), tonumber(max)
+	return cur ~= nil and max ~= nil and cur >= max
+end
+
+local function stripVisuals()
+	local texClasses = { Decal = true, Texture = true, SurfaceAppearance = true }
+	local particleClasses = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
+	local removed, disabled, smoothed = 0, 0, 0
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if texClasses[obj.ClassName] then
+			pcall(function() obj:Destroy() end); removed += 1
+		elseif particleClasses[obj.ClassName] then
+			pcall(function() obj.Enabled = false end); disabled += 1
+		elseif obj:IsA("BasePart") then
+			pcall(function()
+				obj.Material      = Enum.Material.SmoothPlastic
+				obj.TopSurface    = Enum.SurfaceType.Smooth
+				obj.BottomSurface = Enum.SurfaceType.Smooth
+				obj.LeftSurface   = Enum.SurfaceType.Smooth
+				obj.RightSurface  = Enum.SurfaceType.Smooth
+				obj.FrontSurface  = Enum.SurfaceType.Smooth
+				obj.BackSurface   = Enum.SurfaceType.Smooth
+				if obj:IsA("MeshPart") then obj.TextureID = "" end
+			end)
+			smoothed += 1
+		end
+	end
+	print(string.format("[AutoHarvest] Removed %d textures, disabled %d effects, smoothed %d parts.", removed, disabled, smoothed))
+end
+
+local hiddenParts = {}
+local function setOtherPlotsHidden(hide)
+	local gardens = Workspace:FindFirstChild("Gardens")
+	if not gardens then return end
+	if hide then
+		for _, model in ipairs(gardens:GetChildren()) do
+			if model:GetAttribute("Owner") ~= player.Name then
+				for _, obj in ipairs(model:GetDescendants()) do
+					if obj:IsA("BasePart") then
+						if hiddenParts[obj] == nil then hiddenParts[obj] = obj.Transparency end
+						pcall(function() obj.Transparency = 1 end)
+					end
+				end
+			end
+		end
+	else
+		for part, original in pairs(hiddenParts) do
+			if part and part.Parent then pcall(function() part.Transparency = original end) end
+		end
+		table.clear(hiddenParts)
+	end
+end
+
+--==================================================================
+-- AUTO SHOP
+--==================================================================
+local function parseStock(itemFrame)
+	local main = itemFrame:FindFirstChild("Main_Frame")
+	if not main then return nil end
+	local stockLabel = main:FindFirstChild("Stock_Text")
+	if not stockLabel then return nil end
+	local n = string.match(stockLabel.Text, "x(%d+)")
+	return tonumber(n) or 0
+end
+
+local function readShopStock(scrollFrame)
+	local list = {}
+	if not scrollFrame then return list end
+	for _, frame in ipairs(scrollFrame:GetChildren()) do
+		if frame:IsA("Frame") and frame:FindFirstChild("Main_Frame") then
+			local stock = parseStock(frame)
+			if stock and stock > 0 then
+				table.insert(list, { name = frame.Name, stock = stock })
+			end
+		end
+	end
+	return list
+end
+
+local function getSeedShopFrame()
+	local gui = player.PlayerGui:FindFirstChild("SeedShop")
+	if not gui then return nil end
+	local frame = gui:FindFirstChild("Frame")
+	return frame and frame:FindFirstChild("NormalShop") or nil
+end
+local function getGearShopFrame()
+	local gui = player.PlayerGui:FindFirstChild("GearShop")
+	if not gui then return nil end
+	local frame = gui:FindFirstChild("Frame")
+	return frame and (frame:FindFirstChild("NormalShop") or frame:FindFirstChild("Shop")) or nil
+end
+local function getCrateShopFrame()
+	local gui = player.PlayerGui:FindFirstChild("CrateShop")
+	if not gui then return nil end
+	local frame = gui:FindFirstChild("Frame")
+	return frame and (frame:FindFirstChild("NormalShop") or frame:FindFirstChild("Shop")) or nil
+end
+
+local function buyItem(remote, name, count)
+	for _ = 1, count do
+		if not running then break end
+		pcall(function() remote:Fire(name) end)
+		task.wait(0.08)
+	end
+end
+
+local function buyShop(getFrame, remote, filter)
+	for _, item in ipairs(readShopStock(getFrame())) do
+		if filter == nil or filter[item.name] then
+			buyItem(remote, item.name, item.stock)
+		end
+	end
+end
+
+local function buyAllSeeds()  buyShop(getSeedShopFrame,  Networking.SeedShop.PurchaseSeed,  nil); print("[Shop] seeds done")  end
+local function buyAllGear()   buyShop(getGearShopFrame,  Networking.GearShop.PurchaseGear,  nil); print("[Shop] gear done")   end
+local function buyAllCrates() buyShop(getCrateShopFrame, Networking.CrateShop.PurchaseCrate, nil); print("[Shop] crates done") end
+
+--==================================================================
+-- AUTO PETS (wild pet tame) - CONFIRM REMOTE/ID VIA INSPECTION
+--==================================================================
+local function findWildPetsFolder()
+	local map = Workspace:FindFirstChild("Map")
+	return map and map:FindFirstChild("WildPetSpawns") or nil
+end
+
+local function petInfo(model)
+	local name = model:GetAttribute("PetName") or model.Name:match("WildPet_([^_]+)") or model.Name
+	local id   = model.Name:match("WildPet_[^_]+_WildPet_(.+)")
+	return name, id
+end
+
+local function petMatchesFilters(model)
+	local name = petInfo(model)
+	if next(selectedPetNames) == nil then return true end  -- nothing ticked = all
+	return selectedPetNames[name] == true
+end
+
+local function tameWildPet(model)
+	-- Wrap the whole thing in a spawn function so it runs in the background 
+	-- and doesn't freeze or block your main script loop!
+	spawn(function()
+		-- Wait up to 2 seconds for the parts to exist
+		local rootPart = model:WaitForChild("RootPart", 2)
+		if not rootPart then return end
+		
+		local buyPrompt = rootPart:WaitForChild("BuyPrompt", 2)
+		if not buyPrompt or not buyPrompt:IsA("ProximityPrompt") then return end
+		
+		-- Small delay to let the game server register your position
+		wait(0.15)
+		
+		-- Fire the prompt
+		if fireproximityprompt then
+			fireproximityprompt(buyPrompt)
+		else
+			buyPrompt:InputHoldBegin()
+			wait(buyPrompt.HoldDuration + 0.05)
+			buyPrompt:InputHoldEnd()
+		end
+	end)
+end
+
+local function autoTamePets()
+	local folder = findWildPetsFolder()
+	if not folder then return end
+	local hrp = getHRP()
+	for _, model in ipairs(folder:GetChildren()) do
+		if (model:IsA("Model") or model:IsA("Folder")) and petMatchesFilters(model) then
+			if hrp then
+				local part = model:FindFirstChildWhichIsA("BasePart", true)
+				if part then
+					local back = hrp.CFrame
+					hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+					task.wait(TP_SETTLE)
+					tameWildPet(model)
+					task.wait(TP_SETTLE)
+					hrp.CFrame = back
+				else
+					tameWildPet(model)
+				end
+			else
+				tameWildPet(model)
+			end
+		end
+	end
+end
+
+--==================================================================
+-- LOOPS
+--==================================================================
+task.spawn(function()
+	while running do
+		task.wait(LOOP_INTERVAL)
+		if running and enabled and not sweeping then
+			sweeping = true
+			if DO_HARVEST    then activateHarvestPrompts()  end
+			if DO_SEED_PACKS then activateSeedPackPrompts() end
+			sweeping = false
+		end
+	end
+end)
+
+task.spawn(function()
+	while running do
+		task.wait(1)
+		if running and autoBuySeeds then
+			pcall(function() buyShop(getSeedShopFrame, Networking.SeedShop.PurchaseSeed, selectedSeeds) end)
+		end
+		if running and autoBuyGear then
+			pcall(function() buyShop(getGearShopFrame, Networking.GearShop.PurchaseGear, selectedGear) end)
+		end
+		if running and autoBuyCrates then
+			pcall(function() buyShop(getCrateShopFrame, Networking.CrateShop.PurchaseCrate, selectedCrates) end)
+		end
+	end
+end)
+
+task.spawn(function()
+	while running do
+		task.wait(POLL_INTERVAL)
+		if running and AUTO_SELL and isInventoryFull() then
+			pcall(function()
+				local result = Networking.NPCS.SellAll:Fire()
+				if result and result.Success then
+					print(string.format("[AutoHarvest] Inventory full - sold %d for %s", result.SoldCount, tostring(result.SellPrice)))
+				end
+			end)
+		end
+	end
+end)
+
+task.spawn(function()
+	while running do
+		task.wait(COLLECT_INTERVAL)
+		if running and AUTO_COLLECT and not collecting then
+			collecting = true
+			pcall(collectSeedPacks)
+			collecting = false
+		end
+	end
+end)
+
+task.spawn(function()
+	while running do
+		task.wait(0.6)
+		if running and AUTO_PETS then
+			pcall(autoTamePets)
+		end
+	end
+end)
+
+--==================================================================
+-- UI LIBRARY (dark, animated, accented)
+--==================================================================
+local Theme = {
+	BG       = Color3.fromRGB(18, 18, 22),
+	Header   = Color3.fromRGB(24, 24, 30),
+	Panel    = Color3.fromRGB(22, 22, 27),
+	Row      = Color3.fromRGB(30, 30, 37),
+	RowHover = Color3.fromRGB(38, 38, 47),
+	Tab      = Color3.fromRGB(28, 28, 35),
+	TabOn    = Color3.fromRGB(196, 38, 46),
+	Accent   = Color3.fromRGB(220, 44, 52),
+	AccentDk = Color3.fromRGB(140, 26, 32),
+	Text     = Color3.fromRGB(240, 240, 245),
+	SubText  = Color3.fromRGB(140, 140, 150),
+	Off      = Color3.fromRGB(52, 52, 62),
+}
+
+local TW_FAST = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TW_MED  = TweenInfo.new(0.28, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+
+local function tw(obj, info, props)
+	local t = TweenService:Create(obj, info, props)
+	t:Play()
+	return t
+end
+
+local function corner(parent, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r or 8)
+	c.Parent = parent
+	return c
+end
+
+local function stroke(parent, color, thickness, transparency)
+	local s = Instance.new("UIStroke")
+	s.Color = color or Theme.AccentDk
+	s.Thickness = thickness or 1
+	s.Transparency = transparency or 0
+	s.Parent = parent
+	return s
+end
+
+local function gradient(parent, c1, c2, rot)
+	local g = Instance.new("UIGradient")
+	g.Color = ColorSequence.new(c1, c2)
+	g.Rotation = rot or 90
+	g.Parent = parent
+	return g
+end
+
+local Library = {}
+Library.__index = Library
+
+function Library.new(title)
+	local self = setmetatable({}, Library)
+	self.tabs = {}
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name           = "CustomHarvestGui"
+	gui.ResetOnSpawn   = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.IgnoreGuiInset = true
+	gui.Parent         = player:WaitForChild("PlayerGui")
+	self.gui = gui
+
+	local main = Instance.new("Frame")
+	main.Size              = UDim2.fromOffset(420, 360)
+	main.Position          = UDim2.new(0, 40, 0.5, -180)
+	main.BackgroundColor3  = Theme.BG
+	main.BorderSizePixel   = 0
+	main.ClipsDescendants  = true
+	main.Parent            = gui
+	corner(main, 14)
+	stroke(main, Theme.AccentDk, 1.5, 0.2)
+	self.main = main
+
+	main.Size = UDim2.fromOffset(420, 0)
+	tw(main, TW_MED, { Size = UDim2.fromOffset(420, 360) })
+
+	local header = Instance.new("Frame")
+	header.Size             = UDim2.new(1, 0, 0, 46)
+	header.BackgroundColor3 = Theme.Header
+	header.BorderSizePixel  = 0
+	header.Parent           = main
+	gradient(header, Theme.Header, Color3.fromRGB(30, 22, 24), 25)
+
+	local accentBar = Instance.new("Frame")
+	accentBar.Size             = UDim2.new(0, 4, 1, -16)
+	accentBar.Position         = UDim2.fromOffset(0, 8)
+	accentBar.BackgroundColor3 = Theme.Accent
+	accentBar.BorderSizePixel  = 0
+	accentBar.Parent           = header
+	corner(accentBar, 2)
+
+	local titleLbl = Instance.new("TextLabel")
+	titleLbl.Size             = UDim2.new(1, -130, 1, 0)
+	titleLbl.Position         = UDim2.fromOffset(18, 0)
+	titleLbl.BackgroundTransparency = 1
+	titleLbl.Font             = Enum.Font.GothamBold
+	titleLbl.TextSize         = 17
+	titleLbl.TextColor3       = Theme.Text
+	titleLbl.TextXAlignment   = Enum.TextXAlignment.Left
+	titleLbl.Text             = title or "Menu"
+	titleLbl.Parent           = header
+
+	local function makeHeaderBtn(text, xoff, color)
+		local b = Instance.new("TextButton")
+		b.Size             = UDim2.fromOffset(30, 30)
+		b.Position         = UDim2.new(1, xoff, 0, 8)
+		b.BackgroundColor3 = color
+		b.BorderSizePixel  = 0
+		b.Font             = Enum.Font.GothamBold
+		b.TextSize         = 16
+		b.TextColor3       = Theme.Text
+		b.Text             = text
+		b.AutoButtonColor  = false
+		b.Parent           = header
+		corner(b, 7)
+		track(b.MouseEnter:Connect(function() tw(b, TW_FAST, { BackgroundColor3 = Theme.Accent }) end))
+		track(b.MouseLeave:Connect(function() tw(b, TW_FAST, { BackgroundColor3 = color }) end))
+		return b
+	end
+
+	local content
+	local minimized = false
+	local minBtn = makeHeaderBtn("-", -76, Theme.Off)
+	local unloadBtn = makeHeaderBtn("X", -40, Theme.AccentDk)
+
+	track(unloadBtn.MouseButton1Click:Connect(function()
+		tw(main, TW_FAST, { Size = UDim2.fromOffset(420, 0) })
+		task.wait(0.18)
+		unloadEverything()
+	end))
+
+	local tabBar = Instance.new("Frame")
+	tabBar.Size             = UDim2.new(1, -20, 0, 34)
+	tabBar.Position         = UDim2.fromOffset(10, 54)
+	tabBar.BackgroundTransparency = 1
+	tabBar.Parent           = main
+	self.tabBar = tabBar
+
+	local tabLayout = Instance.new("UIListLayout")
+	tabLayout.FillDirection = Enum.FillDirection.Horizontal
+	tabLayout.Padding       = UDim.new(0, 6)
+	tabLayout.SortOrder     = Enum.SortOrder.LayoutOrder
+	tabLayout.Parent        = tabBar
+
+	content = Instance.new("Frame")
+	content.Size             = UDim2.new(1, -20, 1, -100)
+	content.Position         = UDim2.fromOffset(10, 94)
+	content.BackgroundColor3 = Theme.Panel
+	content.BorderSizePixel  = 0
+	content.Parent           = main
+	corner(content, 10)
+	self.content = content
+
+	track(minBtn.MouseButton1Click:Connect(function()
+		minimized = not minimized
+		if minimized then
+			tw(main, TW_MED, { Size = UDim2.fromOffset(420, 100) })
+			content.Visible = false
+		else
+			content.Visible = true
+			tw(main, TW_MED, { Size = UDim2.fromOffset(420, 360) })
+		end
+	end))
+
+	local dragging, dragStart, startPos
+	track(header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true; dragStart = input.Position; startPos = main.Position
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end))
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+
+	return self
+end
+
+function Library:AddTab(name)
+	local btn = Instance.new("TextButton")
+	btn.Size             = UDim2.new(0, 78, 1, 0)
+	btn.BackgroundColor3 = Theme.Tab
+	btn.BorderSizePixel  = 0
+	btn.AutoButtonColor  = false
+	btn.Font             = Enum.Font.GothamSemibold
+	btn.TextSize         = 13
+	btn.TextColor3       = Theme.SubText
+	btn.Text             = name
+	btn.Parent           = self.tabBar
+	corner(btn, 7)
+
+	local page = Instance.new("ScrollingFrame")
+	page.Size                   = UDim2.new(1, 0, 1, 0)
+	page.BackgroundTransparency = 1
+	page.BorderSizePixel        = 0
+	page.ScrollBarThickness     = 4
+	page.ScrollBarImageColor3   = Theme.Accent
+	page.CanvasSize             = UDim2.new(0, 0, 0, 0)
+	page.AutomaticCanvasSize    = Enum.AutomaticSize.Y
+	page.Visible                = false
+	page.Parent                 = self.content
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, 12); pad.PaddingBottom = UDim.new(0, 12)
+	pad.PaddingLeft = UDim.new(0, 12); pad.PaddingRight = UDim.new(0, 12)
+	pad.Parent = page
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = page
+
+	local tab = { btn = btn, page = page }
+	table.insert(self.tabs, tab)
+
+	track(btn.MouseButton1Click:Connect(function()
+		for _, t in ipairs(self.tabs) do
+			local on = (t == tab)
+			t.page.Visible = on
+			tw(t.btn, TW_FAST, {
+				BackgroundColor3 = on and Theme.TabOn or Theme.Tab,
+				TextColor3 = on and Theme.Text or Theme.SubText,
+			})
+		end
+	end))
+
+	if #self.tabs == 1 then
+		page.Visible = true
+		btn.BackgroundColor3 = Theme.TabOn
+		btn.TextColor3 = Theme.Text
+	end
+	return tab
+end
+
+function Library:AddToggle(tab, text, default, onChanged)
+	local holder = Instance.new("TextButton")
+	holder.Size             = UDim2.new(1, 0, 0, 42)
+	holder.BackgroundColor3 = Theme.Row
+	holder.BorderSizePixel  = 0
+	holder.AutoButtonColor  = false
+	holder.Font             = Enum.Font.GothamSemibold
+	holder.TextSize         = 14
+	holder.TextColor3       = Theme.Text
+	holder.TextXAlignment   = Enum.TextXAlignment.Left
+	holder.Text             = "    " .. text
+	holder.Parent           = tab.page
+	corner(holder, 8)
+
+	track(holder.MouseEnter:Connect(function() tw(holder, TW_FAST, { BackgroundColor3 = Theme.RowHover }) end))
+	track(holder.MouseLeave:Connect(function() tw(holder, TW_FAST, { BackgroundColor3 = Theme.Row }) end))
+
+	local pill = Instance.new("Frame")
+	pill.Size             = UDim2.fromOffset(44, 22)
+	pill.Position         = UDim2.new(1, -56, 0.5, -11)
+	pill.BackgroundColor3 = Theme.Off
+	pill.BorderSizePixel  = 0
+	pill.Parent           = holder
+	corner(pill, 11)
+
+	local knob = Instance.new("Frame")
+	knob.Size             = UDim2.fromOffset(18, 18)
+	knob.Position         = UDim2.fromOffset(2, 2)
+	knob.BackgroundColor3 = Theme.SubText
+	knob.BorderSizePixel  = 0
+	knob.Parent           = pill
+	corner(knob, 9)
+
+	local state = default and true or false
+	local function render(animate)
+		local info = animate and TW_FAST or TweenInfo.new(0)
+		tw(pill, info, { BackgroundColor3 = state and Theme.Accent or Theme.Off })
+		tw(knob, info, {
+			Position = state and UDim2.fromOffset(24, 2) or UDim2.fromOffset(2, 2),
+			BackgroundColor3 = state and Theme.Text or Theme.SubText,
+		})
+	end
+	render(false)
+
+	track(holder.MouseButton1Click:Connect(function()
+		state = not state
+		render(true)
+		if onChanged then onChanged(state) end
+	end))
+	return holder
+end
+
+function Library:AddButton(tab, text, callback)
+	local btn = Instance.new("TextButton")
+	btn.Size             = UDim2.new(1, 0, 0, 42)
+	btn.BackgroundColor3 = Theme.AccentDk
+	btn.BorderSizePixel  = 0
+	btn.AutoButtonColor  = false
+	btn.Font             = Enum.Font.GothamBold
+	btn.TextSize         = 14
+	btn.TextColor3       = Theme.Text
+	btn.Text             = text
+	btn.Parent           = tab.page
+	corner(btn, 8)
+	stroke(btn, Theme.Accent, 1, 0.3)
+
+	track(btn.MouseEnter:Connect(function() tw(btn, TW_FAST, { BackgroundColor3 = Theme.Accent }) end))
+	track(btn.MouseLeave:Connect(function() tw(btn, TW_FAST, { BackgroundColor3 = Theme.AccentDk }) end))
+	track(btn.MouseButton1Click:Connect(function()
+		tw(btn, TweenInfo.new(0.08), { BackgroundColor3 = Theme.Text })
+		task.wait(0.08)
+		tw(btn, TW_FAST, { BackgroundColor3 = Theme.Accent })
+		if callback then callback() end
+	end))
+	return btn
+end
+
+function Library:AddCheck(tab, text, default, onChanged)
+	local holder = Instance.new("TextButton")
+	holder.Size             = UDim2.new(1, 0, 0, 32)
+	holder.BackgroundColor3 = Theme.Row
+	holder.BorderSizePixel  = 0
+	holder.AutoButtonColor  = false
+	holder.Font             = Enum.Font.Gotham
+	holder.TextSize         = 13
+	holder.TextColor3       = Theme.Text
+	holder.TextXAlignment   = Enum.TextXAlignment.Left
+	holder.Text             = "    " .. text
+	holder.Parent           = tab.page
+	corner(holder, 6)
+
+	track(holder.MouseEnter:Connect(function() tw(holder, TW_FAST, { BackgroundColor3 = Theme.RowHover }) end))
+	track(holder.MouseLeave:Connect(function() tw(holder, TW_FAST, { BackgroundColor3 = Theme.Row }) end))
+
+	local box = Instance.new("Frame")
+	box.Size             = UDim2.fromOffset(20, 20)
+	box.Position         = UDim2.new(1, -30, 0.5, -10)
+	box.BackgroundColor3 = Theme.Off
+	box.BorderSizePixel  = 0
+	box.Parent           = holder
+	corner(box, 5)
+
+	local tick = Instance.new("Frame")
+	tick.AnchorPoint      = Vector2.new(0.5, 0.5)
+	tick.Position         = UDim2.fromScale(0.5, 0.5)
+	tick.BackgroundColor3 = Theme.Accent
+	tick.BorderSizePixel  = 0
+	tick.Parent           = box
+	corner(tick, 3)
+
+	local state = default and true or false
+	local function render(animate)
+		local info = animate and TW_FAST or TweenInfo.new(0)
+		tw(tick, info, { Size = state and UDim2.fromOffset(12, 12) or UDim2.fromOffset(0, 0) })
+		tw(box, info, { BackgroundColor3 = state and Color3.fromRGB(60, 30, 33) or Theme.Off })
+	end
+	render(false)
+
+	track(holder.MouseButton1Click:Connect(function()
+		state = not state
+		render(true)
+		if onChanged then onChanged(state) end
+	end))
+	return holder
+end
+
+function Library:AddLabel(tab, text)
+	local lbl = Instance.new("TextLabel")
+	lbl.Size             = UDim2.new(1, 0, 0, 18)
+	lbl.BackgroundTransparency = 1
+	lbl.Font             = Enum.Font.GothamBold
+	lbl.TextSize         = 11
+	lbl.TextColor3       = Theme.SubText
+	lbl.TextXAlignment   = Enum.TextXAlignment.Left
+	lbl.Text             = string.upper(text)
+	lbl.Parent           = tab.page
+	return lbl
+end
+
+--==================================================================
+-- BUILD THE WINDOW
+--==================================================================
+local win = Library.new("Garden Hub")
+
+local farmTab   = win:AddTab("Farm")
+local shopTab   = win:AddTab("Shop")
+local petTab    = win:AddTab("Pets")
+local visualTab = win:AddTab("Visuals")
+
+win:AddLabel(farmTab, "Automation")
+win:AddToggle(farmTab, "Auto Harvest", enabled, function(v) enabled = v end)
+win:AddToggle(farmTab, "Auto Sell (at full)", AUTO_SELL, function(v) AUTO_SELL = v end)
+win:AddToggle(farmTab, "Auto Collect Seeds", AUTO_COLLECT, function(v) AUTO_COLLECT = v end)
+win:AddToggle(farmTab, "Hide Other Plots", HIDE_OTHER_PLOTS, function(v) HIDE_OTHER_PLOTS = v; setOtherPlotsHidden(v) end)
+win:AddToggle(farmTab, "Anti-AFK", ANTI_AFK, function(v) ANTI_AFK = v end)
+
+win:AddLabel(shopTab, "Buy All (in-stock)")
+win:AddButton(shopTab, "Buy All Seeds",  function() task.spawn(buyAllSeeds)  end)
+win:AddButton(shopTab, "Buy All Gear",   function() task.spawn(buyAllGear)   end)
+win:AddButton(shopTab, "Buy All Crates", function() task.spawn(buyAllCrates) end)
+
+win:AddLabel(shopTab, "Auto-Buy Selected")
+win:AddToggle(shopTab, "Auto-Buy Seeds",  autoBuySeeds,  function(v) autoBuySeeds  = v end)
+win:AddToggle(shopTab, "Auto-Buy Gear",   autoBuyGear,   function(v) autoBuyGear   = v end)
+win:AddToggle(shopTab, "Auto-Buy Crates", autoBuyCrates, function(v) autoBuyCrates = v end)
+
+local function buildChecklist(getFrame, selectionTable, rowStore)
+	for _, row in ipairs(rowStore) do row:Destroy() end
+	table.clear(rowStore)
+	local frame = getFrame()
+	if not frame then
+		rowStore[#rowStore+1] = win:AddLabel(shopTab, "Open that shop in-game, then Refresh.")
+		return
+	end
+	for _, child in ipairs(frame:GetChildren()) do
+		local main = child:IsA("Frame") and child:FindFirstChild("Main_Frame")
+		if main and main:FindFirstChild("Stock_Text") then
+			local name = child.Name
+			local row = win:AddCheck(shopTab, name, selectionTable[name] == true, function(on)
+				selectionTable[name] = on or nil
+			end)
+			rowStore[#rowStore+1] = row
+		end
+	end
+end
+
+local seedRows, gearRows, crateRows = {}, {}, {}
+
+win:AddLabel(shopTab, "Seed Selection")
+win:AddButton(shopTab, "Refresh Seed List", function() buildChecklist(getSeedShopFrame, selectedSeeds, seedRows) end)
+win:AddLabel(shopTab, "Gear Selection")
+win:AddButton(shopTab, "Refresh Gear List", function() buildChecklist(getGearShopFrame, selectedGear, gearRows) end)
+win:AddLabel(shopTab, "Crate Selection")
+win:AddButton(shopTab, "Refresh Crate List", function() buildChecklist(getCrateShopFrame, selectedCrates, crateRows) end)
+buildChecklist(getSeedShopFrame, selectedSeeds, seedRows)
+
+win:AddLabel(petTab, "Wild Pet Auto-Tame")
+win:AddToggle(petTab, "Auto-Tame Pets", AUTO_PETS, function(v) AUTO_PETS = v end)
+
+local petRows = {}
+local function refreshPetNames()
+	for _, row in ipairs(petRows) do row:Destroy() end
+	table.clear(petRows)
+	local folder = findWildPetsFolder()
+	local seen = {}
+	if folder then
+		for _, m in ipairs(folder:GetChildren()) do
+			local n = m:GetAttribute("PetName") or m:GetAttribute("DisplayName") or m.Name
+			if n and not seen[n] then
+				seen[n] = true
+				local row = win:AddCheck(petTab, n, selectedPetNames[n] == true, function(on)
+					selectedPetNames[n] = on or nil
+				end)
+				petRows[#petRows+1] = row
+			end
+		end
+	end
+	if #petRows == 0 then
+		petRows[#petRows+1] = win:AddLabel(petTab, "No wild pets found right now.")
+	end
+end
+win:AddLabel(petTab, "Filter by Name")
+win:AddButton(petTab, "Refresh Pet Names", function() refreshPetNames() end)
+
+win:AddLabel(visualTab, "Performance")
+win:AddButton(visualTab, "Strip Textures + Particles", function() stripVisuals() end)
+win:AddLabel(visualTab, "Removes decals/textures, smooths parts,")
+win:AddLabel(visualTab, "disables particles/trails/beams/smoke/fire.")
