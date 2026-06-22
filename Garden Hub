@@ -14,121 +14,6 @@ local player    = Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
 
 --==================================================================
--- CONFIG SYSTEM
---==================================================================
-local CONFIG_FOLDER = "AutoHarvestConfigs"
-local DEFAULT_CONFIG_NAME = "default"
-local AUTOLOAD_FILE_PATH = CONFIG_FOLDER .. "/autoload_target.txt"
-
-local function getConfigPath(name)
-    return CONFIG_FOLDER .. "/" .. (name or DEFAULT_CONFIG_NAME) .. ".json"
-end
-
-local function ensureConfigFolder()
-    if not isfolder(CONFIG_FOLDER) then
-        makefolder(CONFIG_FOLDER)
-    end
-end
-
-local function saveConfig(name)
-    ensureConfigFolder()
-    local config = {
-        enabled = enabled,
-        AUTO_SELL = AUTO_SELL,
-        AUTO_COLLECT = AUTO_COLLECT,
-        ANTI_AFK = ANTI_AFK,
-        HIDE_OTHER_PLOTS = HIDE_OTHER_PLOTS,
-        AUTO_PETS = AUTO_PETS,
-        autoBuySeeds = autoBuySeeds,
-        autoBuyGear = autoBuyGear,
-        autoBuyCrates = autoBuyCrates,
-        LOOP_INTERVAL = LOOP_INTERVAL,
-        POLL_INTERVAL = POLL_INTERVAL,
-        COLLECT_INTERVAL = COLLECT_INTERVAL,
-        TP_SETTLE = TP_SETTLE,
-        RETURN_TO_START = RETURN_TO_START,
-        selectedSeeds = selectedSeeds,
-        selectedGear = selectedGear,
-        selectedCrates = selectedCrates,
-        selectedPetNames = selectedPetNames,
-    }
-    local success, err = pcall(function()
-        writefile(getConfigPath(name), HttpService:JSONEncode(config))
-    end)
-    if success then
-        print("[Config] Saved '" .. name .. "'")
-        return true
-    else
-        warn("[Config] Save failed: " .. tostring(err))
-        return false
-    end
-end
-
-local function loadConfig(name)
-    local path = getConfigPath(name)
-    if not isfile(path) then
-        warn("[Config] No config found: '" .. name .. "'")
-        return false
-    end
-    local success, result = pcall(function()
-        return HttpService:JSONDecode(readfile(path))
-    end)
-    if not success or type(result) ~= "table" then
-        warn("[Config] Load failed: invalid file")
-        return false
-    end
-
-    -- Apply config values
-    if result.enabled ~= nil then enabled = result.enabled end
-    if result.AUTO_SELL ~= nil then AUTO_SELL = result.AUTO_SELL end
-    if result.AUTO_COLLECT ~= nil then AUTO_COLLECT = result.AUTO_COLLECT end
-    if result.ANTI_AFK ~= nil then ANTI_AFK = result.ANTI_AFK end
-    if result.HIDE_OTHER_PLOTS ~= nil then 
-        HIDE_OTHER_PLOTS = result.HIDE_OTHER_PLOTS 
-        setOtherPlotsHidden(HIDE_OTHER_PLOTS)
-    end
-    if result.AUTO_PETS ~= nil then AUTO_PETS = result.AUTO_PETS end
-    if result.autoBuySeeds ~= nil then autoBuySeeds = result.autoBuySeeds end
-    if result.autoBuyGear ~= nil then autoBuyGear = result.autoBuyGear end
-    if result.autoBuyCrates ~= nil then autoBuyCrates = result.autoBuyCrates end
-    if result.LOOP_INTERVAL ~= nil then LOOP_INTERVAL = result.LOOP_INTERVAL end
-    if result.POLL_INTERVAL ~= nil then POLL_INTERVAL = result.POLL_INTERVAL end
-    if result.COLLECT_INTERVAL ~= nil then COLLECT_INTERVAL = result.COLLECT_INTERVAL end
-    if result.TP_SETTLE ~= nil then TP_SETTLE = result.TP_SETTLE end
-    if result.RETURN_TO_START ~= nil then RETURN_TO_START = result.RETURN_TO_START end
-    if result.selectedSeeds ~= nil then selectedSeeds = result.selectedSeeds end
-    if result.selectedGear ~= nil then selectedGear = result.selectedGear end
-    if result.selectedCrates ~= nil then selectedCrates = result.selectedCrates end
-    if result.selectedPetNames ~= nil then selectedPetNames = result.selectedPetNames end
-
-    print("[Config] Loaded '" .. name .. "'")
-    return true
-end
-
-local function listConfigs()
-    ensureConfigFolder()
-    local files = listfiles(CONFIG_FOLDER)
-    local configs = {}
-    for _, path in ipairs(files) do
-        local name = path:match(CONFIG_FOLDER .. "/(.+)%.json$")
-        if name then
-            table.insert(configs, name)
-        end
-    end
-    return configs
-end
-
-local function deleteConfig(name)
-    local path = getConfigPath(name)
-    if isfile(path) then
-        delfile(path)
-        print("[Config] Deleted '" .. name .. "'")
-        return true
-    end
-    return false
-end
-
---==================================================================
 -- LIFECYCLE / CLEANUP
 --==================================================================
 local running     = true
@@ -230,6 +115,17 @@ local function activateHarvestPrompts()
 	local garden = getMyGarden();
 	if not garden then return end
 	local plants = garden:FindFirstChild("Plants");  if not plants then return end
+
+	-- The game uses StreamingEnabled, so when you walk away from the garden the
+	-- plant/fruit instances get unloaded on your client and this loop finds
+	-- almost nothing to collect (the "super slow when far" symptom). Ask the
+	-- engine to stream the garden in around its position WITHOUT moving the
+	-- character. This is a no-op if streaming is off, so it's always safe.
+	pcall(function()
+		local pos = garden:GetPivot().Position
+		player:RequestStreamAroundAsync(pos)
+	end)
+
 	for _, plant in ipairs(plants:GetChildren()) do
 		if not (enabled and running) then break end
 		local plantId = plant:GetAttribute("PlantId")
@@ -349,6 +245,123 @@ local function setOtherPlotsHidden(hide)
 end
 
 --==================================================================
+-- CONFIG SYSTEM
+-- (Defined AFTER the state variables and setOtherPlotsHidden so that
+--  save/load capture the real locals as upvalues instead of nil globals.)
+--==================================================================
+local CONFIG_FOLDER = "AutoHarvestConfigs"
+local DEFAULT_CONFIG_NAME = "default"
+local AUTOLOAD_FILE_PATH = CONFIG_FOLDER .. "/autoload_target.txt"
+
+local function getConfigPath(name)
+    return CONFIG_FOLDER .. "/" .. (name or DEFAULT_CONFIG_NAME) .. ".json"
+end
+
+local function ensureConfigFolder()
+    if not isfolder(CONFIG_FOLDER) then
+        makefolder(CONFIG_FOLDER)
+    end
+end
+
+local function saveConfig(name)
+    ensureConfigFolder()
+    local config = {
+        enabled = enabled,
+        AUTO_SELL = AUTO_SELL,
+        AUTO_COLLECT = AUTO_COLLECT,
+        ANTI_AFK = ANTI_AFK,
+        HIDE_OTHER_PLOTS = HIDE_OTHER_PLOTS,
+        AUTO_PETS = AUTO_PETS,
+        autoBuySeeds = autoBuySeeds,
+        autoBuyGear = autoBuyGear,
+        autoBuyCrates = autoBuyCrates,
+        LOOP_INTERVAL = LOOP_INTERVAL,
+        POLL_INTERVAL = POLL_INTERVAL,
+        COLLECT_INTERVAL = COLLECT_INTERVAL,
+        TP_SETTLE = TP_SETTLE,
+        RETURN_TO_START = RETURN_TO_START,
+        selectedSeeds = selectedSeeds,
+        selectedGear = selectedGear,
+        selectedCrates = selectedCrates,
+        selectedPetNames = selectedPetNames,
+    }
+    local success, err = pcall(function()
+        writefile(getConfigPath(name), HttpService:JSONEncode(config))
+    end)
+    if success then
+        print("[Config] Saved '" .. name .. "'")
+        return true
+    else
+        warn("[Config] Save failed: " .. tostring(err))
+        return false
+    end
+end
+
+local function loadConfig(name)
+    local path = getConfigPath(name)
+    if not isfile(path) then
+        warn("[Config] No config found: '" .. name .. "'")
+        return false
+    end
+    local success, result = pcall(function()
+        return HttpService:JSONDecode(readfile(path))
+    end)
+    if not success or type(result) ~= "table" then
+        warn("[Config] Load failed: invalid file")
+        return false
+    end
+
+    -- Apply config values
+    if result.enabled ~= nil then enabled = result.enabled end
+    if result.AUTO_SELL ~= nil then AUTO_SELL = result.AUTO_SELL end
+    if result.AUTO_COLLECT ~= nil then AUTO_COLLECT = result.AUTO_COLLECT end
+    if result.ANTI_AFK ~= nil then ANTI_AFK = result.ANTI_AFK end
+    if result.HIDE_OTHER_PLOTS ~= nil then
+        HIDE_OTHER_PLOTS = result.HIDE_OTHER_PLOTS
+        setOtherPlotsHidden(HIDE_OTHER_PLOTS)
+    end
+    if result.AUTO_PETS ~= nil then AUTO_PETS = result.AUTO_PETS end
+    if result.autoBuySeeds ~= nil then autoBuySeeds = result.autoBuySeeds end
+    if result.autoBuyGear ~= nil then autoBuyGear = result.autoBuyGear end
+    if result.autoBuyCrates ~= nil then autoBuyCrates = result.autoBuyCrates end
+    if result.LOOP_INTERVAL ~= nil then LOOP_INTERVAL = result.LOOP_INTERVAL end
+    if result.POLL_INTERVAL ~= nil then POLL_INTERVAL = result.POLL_INTERVAL end
+    if result.COLLECT_INTERVAL ~= nil then COLLECT_INTERVAL = result.COLLECT_INTERVAL end
+    if result.TP_SETTLE ~= nil then TP_SETTLE = result.TP_SETTLE end
+    if result.RETURN_TO_START ~= nil then RETURN_TO_START = result.RETURN_TO_START end
+    if result.selectedSeeds ~= nil then selectedSeeds = result.selectedSeeds end
+    if result.selectedGear ~= nil then selectedGear = result.selectedGear end
+    if result.selectedCrates ~= nil then selectedCrates = result.selectedCrates end
+    if result.selectedPetNames ~= nil then selectedPetNames = result.selectedPetNames end
+
+    print("[Config] Loaded '" .. name .. "'")
+    return true
+end
+
+local function listConfigs()
+    ensureConfigFolder()
+    local files = listfiles(CONFIG_FOLDER)
+    local configs = {}
+    for _, path in ipairs(files) do
+        local name = path:match(CONFIG_FOLDER .. "/(.+)%.json$")
+        if name then
+            table.insert(configs, name)
+        end
+    end
+    return configs
+end
+
+local function deleteConfig(name)
+    local path = getConfigPath(name)
+    if isfile(path) then
+        delfile(path)
+        print("[Config] Deleted '" .. name .. "'")
+        return true
+    end
+    return false
+end
+
+--==================================================================
 -- AUTO SHOP
 --==================================================================
 local function parseStock(itemFrame)
@@ -418,7 +431,39 @@ local function buyAllCrates() buyShop(getCrateShopFrame, Networking.CrateShop.Pu
 --==================================================================
 local function findWildPetsFolder()
 	local map = Workspace:FindFirstChild("Map")
-	return map and map:FindFirstChild("WildPetSpawns") or nil
+	if not map then return nil end
+	-- Try a few likely names; games rename these between updates.
+	return map:FindFirstChild("WildPetSpawns")
+		or map:FindFirstChild("WildPets")
+		or map:FindFirstChild("WildPetSpawn")
+		or Workspace:FindFirstChild("WildPetSpawns")
+		or nil
+end
+
+-- Prints the live wild-pet hierarchy so we can confirm names/paths.
+local function debugWildPets()
+	local folder = findWildPetsFolder()
+	if not folder then
+		warn("[Pets] No wild pet folder found. Children of Map:")
+		local map = Workspace:FindFirstChild("Map")
+		if map then
+			for _, c in ipairs(map:GetChildren()) do
+				print("   Map > " .. c.Name .. "  (" .. c.ClassName .. ")")
+			end
+		else
+			warn("   Workspace.Map itself is missing.")
+		end
+		return
+	end
+	print("[Pets] Found folder: " .. folder:GetFullName())
+	local kids = folder:GetChildren()
+	print("[Pets] " .. #kids .. " children.")
+	for i, m in ipairs(kids) do
+		if i > 5 then print("   ... (truncated)"); break end
+		print(string.format("   [%d] %s (%s)", i, m.Name, m.ClassName))
+		local prompt = m:FindFirstChildWhichIsA("ProximityPrompt", true)
+		print("        prompt: " .. (prompt and prompt:GetFullName() or "NONE FOUND"))
+	end
 end
 
 local function petInfo(model)
@@ -433,49 +478,46 @@ local function petMatchesFilters(model)
 	return selectedPetNames[name] == true
 end
 
+-- Tame a wild pet by firing the dedicated remote directly. No proximity
+-- prompt, no teleport -- this is what the BuyPrompt ultimately triggers
+-- anyway, so we skip straight to it.
 local function tameWildPet(model)
-	task.spawn(function()
-		local rootPart = model:WaitForChild("RootPart", 2)
-		if not rootPart then return end
-
-		local buyPrompt = rootPart:WaitForChild("BuyPrompt", 2)
-		if not buyPrompt or not buyPrompt:IsA("ProximityPrompt") then return end
-
-		task.wait(0.15)
-
-		if fireproximityprompt then
-			fireproximityprompt(buyPrompt)
-		else
-			buyPrompt:InputHoldBegin()
-			task.wait(buyPrompt.HoldDuration + 0.05)
-			buyPrompt:InputHoldEnd()
-		end
+	pcall(function()
+		Networking.Pets.WildPetTame:Fire(model)
 	end)
 end
 
 local function autoTamePets()
 	local folder = findWildPetsFolder()
 	if not folder then return end
-	local hrp = getHRP()
 	for _, model in ipairs(folder:GetChildren()) do
+		if not (running and AUTO_PETS) then break end
 		if (model:IsA("Model") or model:IsA("Folder")) and petMatchesFilters(model) then
-			if hrp then
-				local part = model:FindFirstChildWhichIsA("BasePart", true)
-				if part then
-					local back = hrp.CFrame
-					hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
-					task.wait(TP_SETTLE)
-					tameWildPet(model)
-					task.wait(TP_SETTLE)
-					hrp.CFrame = back
-				else
-					tameWildPet(model)
-				end
-			else
-				tameWildPet(model)
-			end
+			tameWildPet(model)
+			task.wait() -- small yield so a big batch doesn't fire all in one frame
 		end
 	end
+end
+
+-- One-shot tester: fires WildPetTame on the first matching pet and reports,
+-- so we can confirm the remote argument is correct without the loop running.
+local function testTameFirstPet()
+	local folder = findWildPetsFolder()
+	if not folder then warn("[Pets] No wild pet folder found.") return end
+	for _, model in ipairs(folder:GetChildren()) do
+		if (model:IsA("Model") or model:IsA("Folder")) and petMatchesFilters(model) then
+			local name = petInfo(model)
+			print("[Pets] Firing WildPetTame on: " .. model.Name .. "  (name=" .. tostring(name) .. ")")
+			local ok, err = pcall(function() Networking.Pets.WildPetTame:Fire(model) end)
+			if ok then
+				print("[Pets] Fired OK. If nothing happened, the remote may want the pet id string instead of the model -- tell me and I'll switch it.")
+			else
+				warn("[Pets] Fire errored: " .. tostring(err) .. "  (likely wrong argument type; the id string is the alternative.)")
+			end
+			return
+		end
+	end
+	warn("[Pets] No matching wild pets to test on.")
 end
 
 --==================================================================
@@ -1057,6 +1099,8 @@ local function refreshPetNames()
 end
 win:AddLabel(petTab, "Filter by Name")
 win:AddButton(petTab, "Refresh Pet Names", function() refreshPetNames() end)
+win:AddButton(petTab, "Debug Pets (check output)", function() debugWildPets() end)
+win:AddButton(petTab, "Test Tame First Pet", function() testTameFirstPet() end)
 
 -- Visual Tab
 win:AddLabel(visualTab, "Performance")
@@ -1070,12 +1114,32 @@ win:AddLabel(configTab, "Save / Load Configs")
 local currentConfigName = DEFAULT_CONFIG_NAME
 local configNameBox
 
+-- Forward-declare so the Save/Delete button callbacks below capture the
+-- real function as an upvalue instead of a nil global.
+local refreshConfigList
+
 local _, configBox = win:AddTextBox(configTab, "Config Name", "default", function(text)
 	currentConfigName = text:gsub("[^%w_-]", ""):sub(1, 32)
 	if currentConfigName == "" then currentConfigName = DEFAULT_CONFIG_NAME end
 end)
 configNameBox = configBox
 configNameBox.Text = currentConfigName
+
+local function applyLoadedStateToUI()
+	setEnabled(enabled)
+	setAutoSell(AUTO_SELL)
+	setAutoCollect(AUTO_COLLECT)
+	setHidePlots(HIDE_OTHER_PLOTS)
+	setAntiAfk(ANTI_AFK)
+	setAutoPets(AUTO_PETS)
+	setAutoBuySeeds(autoBuySeeds)
+	setAutoBuyGear(autoBuyGear)
+	setAutoBuyCrates(autoBuyCrates)
+	buildChecklist(getSeedShopFrame, selectedSeeds, seedRows)
+	buildChecklist(getGearShopFrame, selectedGear, gearRows)
+	buildChecklist(getCrateShopFrame, selectedCrates, crateRows)
+	refreshPetNames()
+end
 
 win:AddButton(configTab, "Save Config", function()
 	local name = currentConfigName
@@ -1088,23 +1152,11 @@ end)
 win:AddButton(configTab, "Load Config", function()
 	local name = currentConfigName
 	if loadConfig(name) then
-		setEnabled(enabled)
-		setAutoSell(AUTO_SELL)
-		setAutoCollect(AUTO_COLLECT)
-		setHidePlots(HIDE_OTHER_PLOTS)
-		setAntiAfk(ANTI_AFK)
-		setAutoPets(AUTO_PETS)
-		setAutoBuySeeds(autoBuySeeds)
-		setAutoBuyGear(autoBuyGear)
-		setAutoBuyCrates(autoBuyCrates)
-		buildChecklist(getSeedShopFrame, selectedSeeds, seedRows)
-		buildChecklist(getGearShopFrame, selectedGear, gearRows)
-		buildChecklist(getCrateShopFrame, selectedCrates, crateRows)
-		refreshPetNames()
+		applyLoadedStateToUI()
 	end
 end)
 
--- NEW AUTOLOAD SELECTION BUTTON
+-- AUTOLOAD SELECTION BUTTON
 win:AddButton(configTab, "Set as Autoload", function()
 	ensureConfigFolder()
 	local success, err = pcall(function()
@@ -1125,7 +1177,7 @@ end)
 win:AddLabel(configTab, "Saved Configs")
 local configListLabel = win:AddLabel(configTab, "None")
 
-local function refreshConfigList()
+function refreshConfigList()
 	local configs = listConfigs()
 	if #configs == 0 then
 		configListLabel.Text = "NONE"
@@ -1149,16 +1201,8 @@ pcall(function()
 	end
 
 	if loadConfig(targetConfig) then
-		setEnabled(enabled)
-		setAutoSell(AUTO_SELL)
-		setAutoCollect(AUTO_COLLECT)
-		setHidePlots(HIDE_OTHER_PLOTS)
-		setAntiAfk(ANTI_AFK)
-		setAutoPets(AUTO_PETS)
-		setAutoBuySeeds(autoBuySeeds)
-		setAutoBuyGear(autoBuyGear)
-		setAutoBuyCrates(autoBuyCrates)
-		
+		applyLoadedStateToUI()
+
 		-- Sync the UI Textbox to match what was loaded
 		if configNameBox then
 			configNameBox.Text = targetConfig
