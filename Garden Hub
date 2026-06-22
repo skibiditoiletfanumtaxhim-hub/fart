@@ -8,9 +8,124 @@ local UserInputService       = game:GetService("UserInputService")
 local ProximityPromptService = game:GetService("ProximityPromptService")
 local VirtualUser            = game:GetService("VirtualUser")
 local TweenService           = game:GetService("TweenService")
+local HttpService            = game:GetService("HttpService")
 
 local player    = Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
+
+--==================================================================
+-- CONFIG SYSTEM
+--==================================================================
+local CONFIG_FOLDER = "AutoHarvestConfigs"
+local DEFAULT_CONFIG_NAME = "default"
+
+local function getConfigPath(name)
+    return CONFIG_FOLDER .. "/" .. (name or DEFAULT_CONFIG_NAME) .. ".json"
+end
+
+local function ensureConfigFolder()
+    if not isfolder(CONFIG_FOLDER) then
+        makefolder(CONFIG_FOLDER)
+    end
+end
+
+local function saveConfig(name)
+    ensureConfigFolder()
+    local config = {
+        enabled = enabled,
+        AUTO_SELL = AUTO_SELL,
+        AUTO_COLLECT = AUTO_COLLECT,
+        ANTI_AFK = ANTI_AFK,
+        HIDE_OTHER_PLOTS = HIDE_OTHER_PLOTS,
+        AUTO_PETS = AUTO_PETS,
+        autoBuySeeds = autoBuySeeds,
+        autoBuyGear = autoBuyGear,
+        autoBuyCrates = autoBuyCrates,
+        LOOP_INTERVAL = LOOP_INTERVAL,
+        POLL_INTERVAL = POLL_INTERVAL,
+        COLLECT_INTERVAL = COLLECT_INTERVAL,
+        TP_SETTLE = TP_SETTLE,
+        RETURN_TO_START = RETURN_TO_START,
+        selectedSeeds = selectedSeeds,
+        selectedGear = selectedGear,
+        selectedCrates = selectedCrates,
+        selectedPetNames = selectedPetNames,
+    }
+    local success, err = pcall(function()
+        writefile(getConfigPath(name), HttpService:JSONEncode(config))
+    end)
+    if success then
+        print("[Config] Saved '" .. name .. "'")
+        return true
+    else
+        warn("[Config] Save failed: " .. tostring(err))
+        return false
+    end
+end
+
+local function loadConfig(name)
+    local path = getConfigPath(name)
+    if not isfile(path) then
+        warn("[Config] No config found: '" .. name .. "'")
+        return false
+    end
+    local success, result = pcall(function()
+        return HttpService:JSONDecode(readfile(path))
+    end)
+    if not success or type(result) ~= "table" then
+        warn("[Config] Load failed: invalid file")
+        return false
+    end
+
+    -- Apply config values
+    if result.enabled ~= nil then enabled = result.enabled end
+    if result.AUTO_SELL ~= nil then AUTO_SELL = result.AUTO_SELL end
+    if result.AUTO_COLLECT ~= nil then AUTO_COLLECT = result.AUTO_COLLECT end
+    if result.ANTI_AFK ~= nil then ANTI_AFK = result.ANTI_AFK end
+    if result.HIDE_OTHER_PLOTS ~= nil then 
+        HIDE_OTHER_PLOTS = result.HIDE_OTHER_PLOTS 
+        setOtherPlotsHidden(HIDE_OTHER_PLOTS)
+    end
+    if result.AUTO_PETS ~= nil then AUTO_PETS = result.AUTO_PETS end
+    if result.autoBuySeeds ~= nil then autoBuySeeds = result.autoBuySeeds end
+    if result.autoBuyGear ~= nil then autoBuyGear = result.autoBuyGear end
+    if result.autoBuyCrates ~= nil then autoBuyCrates = result.autoBuyCrates end
+    if result.LOOP_INTERVAL ~= nil then LOOP_INTERVAL = result.LOOP_INTERVAL end
+    if result.POLL_INTERVAL ~= nil then POLL_INTERVAL = result.POLL_INTERVAL end
+    if result.COLLECT_INTERVAL ~= nil then COLLECT_INTERVAL = result.COLLECT_INTERVAL end
+    if result.TP_SETTLE ~= nil then TP_SETTLE = result.TP_SETTLE end
+    if result.RETURN_TO_START ~= nil then RETURN_TO_START = result.RETURN_TO_START end
+    if result.selectedSeeds ~= nil then selectedSeeds = result.selectedSeeds end
+    if result.selectedGear ~= nil then selectedGear = result.selectedGear end
+    if result.selectedCrates ~= nil then selectedCrates = result.selectedCrates end
+    if result.selectedPetNames ~= nil then selectedPetNames = result.selectedPetNames end
+
+    print("[Config] Loaded '" .. name .. "'")
+    return true
+end
+
+local function listConfigs()
+    ensureConfigFolder()
+    local files = listfiles(CONFIG_FOLDER)
+    local configs = {}
+    for _, path in ipairs(files) do
+        local name = path:match(CONFIG_FOLDER .. "/(.+)%.json$")
+        if name then
+            table.insert(configs, name)
+        end
+    end
+    return configs
+end
+
+local function deleteConfig(name)
+    local path = getConfigPath(name)
+    if isfile(path) then
+        delfile(path)
+        print("[Config] Deleted '" .. name .. "'")
+        return true
+    end
+    return false
+end
 
 --==================================================================
 -- LIFECYCLE / CLEANUP
@@ -316,13 +431,13 @@ local function tameWildPet(model)
 		-- Wait up to 2 seconds for the parts to exist
 		local rootPart = model:WaitForChild("RootPart", 2)
 		if not rootPart then return end
-		
+
 		local buyPrompt = rootPart:WaitForChild("BuyPrompt", 2)
 		if not buyPrompt or not buyPrompt:IsA("ProximityPrompt") then return end
-		
+
 		-- Small delay to let the game server register your position
 		wait(0.15)
-		
+
 		-- Fire the prompt
 		if fireproximityprompt then
 			fireproximityprompt(buyPrompt)
@@ -717,7 +832,7 @@ function Library:AddToggle(tab, text, default, onChanged)
 		render(true)
 		if onChanged then onChanged(state) end
 	end))
-	return holder
+	return holder, function() return state end, function(v) state = v; render(true); if onChanged then onChanged(v) end end
 end
 
 function Library:AddButton(tab, text, callback)
@@ -791,7 +906,7 @@ function Library:AddCheck(tab, text, default, onChanged)
 		render(true)
 		if onChanged then onChanged(state) end
 	end))
-	return holder
+	return holder, function() return state end, function(v) state = v; render(true); if onChanged then onChanged(v) end end
 end
 
 function Library:AddLabel(tab, text)
@@ -807,6 +922,49 @@ function Library:AddLabel(tab, text)
 	return lbl
 end
 
+function Library:AddTextBox(tab, text, placeholder, onSubmit)
+	local holder = Instance.new("Frame")
+	holder.Size             = UDim2.new(1, 0, 0, 38)
+	holder.BackgroundColor3 = Theme.Row
+	holder.BorderSizePixel  = 0
+	holder.Parent           = tab.page
+	corner(holder, 8)
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size             = UDim2.new(0.5, -8, 1, 0)
+	lbl.Position         = UDim2.fromOffset(12, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.Font             = Enum.Font.GothamSemibold
+	lbl.TextSize         = 13
+	lbl.TextColor3       = Theme.Text
+	lbl.TextXAlignment   = Enum.TextXAlignment.Left
+	lbl.Text             = text
+	lbl.Parent           = holder
+
+	local box = Instance.new("TextBox")
+	box.Size             = UDim2.new(0.5, -8, 0, 28)
+	box.Position         = UDim2.new(0.5, 0, 0.5, -14)
+	box.BackgroundColor3 = Theme.BG
+	box.BorderSizePixel  = 0
+	box.Font             = Enum.Font.Gotham
+	box.TextSize         = 12
+	box.TextColor3       = Theme.Text
+	box.PlaceholderText  = placeholder or ""
+	box.PlaceholderColor3 = Theme.SubText
+	box.Text             = ""
+	box.ClearTextOnFocus = false
+	box.Parent           = holder
+	corner(box, 6)
+	stroke(box, Theme.AccentDk, 1, 0.4)
+
+	track(box.FocusLost:Connect(function(enterPressed)
+		if enterPressed and onSubmit then
+			onSubmit(box.Text)
+		end
+	end))
+	return holder, box
+end
+
 --==================================================================
 -- BUILD THE WINDOW
 --==================================================================
@@ -816,23 +974,26 @@ local farmTab   = win:AddTab("Farm")
 local shopTab   = win:AddTab("Shop")
 local petTab    = win:AddTab("Pets")
 local visualTab = win:AddTab("Visuals")
+local configTab = win:AddTab("Config")
 
+-- Farm Tab
 win:AddLabel(farmTab, "Automation")
-win:AddToggle(farmTab, "Auto Harvest", enabled, function(v) enabled = v end)
-win:AddToggle(farmTab, "Auto Sell (at full)", AUTO_SELL, function(v) AUTO_SELL = v end)
-win:AddToggle(farmTab, "Auto Collect Seeds", AUTO_COLLECT, function(v) AUTO_COLLECT = v end)
-win:AddToggle(farmTab, "Hide Other Plots", HIDE_OTHER_PLOTS, function(v) HIDE_OTHER_PLOTS = v; setOtherPlotsHidden(v) end)
-win:AddToggle(farmTab, "Anti-AFK", ANTI_AFK, function(v) ANTI_AFK = v end)
+local _, getEnabled, setEnabled = win:AddToggle(farmTab, "Auto Harvest", enabled, function(v) enabled = v end)
+local _, getAutoSell, setAutoSell = win:AddToggle(farmTab, "Auto Sell (at full)", AUTO_SELL, function(v) AUTO_SELL = v end)
+local _, getAutoCollect, setAutoCollect = win:AddToggle(farmTab, "Auto Collect Seeds", AUTO_COLLECT, function(v) AUTO_COLLECT = v end)
+local _, getHidePlots, setHidePlots = win:AddToggle(farmTab, "Hide Other Plots", HIDE_OTHER_PLOTS, function(v) HIDE_OTHER_PLOTS = v; setOtherPlotsHidden(v) end)
+local _, getAntiAfk, setAntiAfk = win:AddToggle(farmTab, "Anti-AFK", ANTI_AFK, function(v) ANTI_AFK = v end)
 
+-- Shop Tab
 win:AddLabel(shopTab, "Buy All (in-stock)")
 win:AddButton(shopTab, "Buy All Seeds",  function() task.spawn(buyAllSeeds)  end)
 win:AddButton(shopTab, "Buy All Gear",   function() task.spawn(buyAllGear)   end)
 win:AddButton(shopTab, "Buy All Crates", function() task.spawn(buyAllCrates) end)
 
 win:AddLabel(shopTab, "Auto-Buy Selected")
-win:AddToggle(shopTab, "Auto-Buy Seeds",  autoBuySeeds,  function(v) autoBuySeeds  = v end)
-win:AddToggle(shopTab, "Auto-Buy Gear",   autoBuyGear,   function(v) autoBuyGear   = v end)
-win:AddToggle(shopTab, "Auto-Buy Crates", autoBuyCrates, function(v) autoBuyCrates = v end)
+local _, getAutoBuySeeds, setAutoBuySeeds = win:AddToggle(shopTab, "Auto-Buy Seeds",  autoBuySeeds,  function(v) autoBuySeeds  = v end)
+local _, getAutoBuyGear, setAutoBuyGear = win:AddToggle(shopTab, "Auto-Buy Gear",   autoBuyGear,   function(v) autoBuyGear   = v end)
+local _, getAutoBuyCrates, setAutoBuyCrates = win:AddToggle(shopTab, "Auto-Buy Crates", autoBuyCrates, function(v) autoBuyCrates = v end)
 
 local function buildChecklist(getFrame, selectionTable, rowStore)
 	for _, row in ipairs(rowStore) do row:Destroy() end
@@ -864,8 +1025,9 @@ win:AddLabel(shopTab, "Crate Selection")
 win:AddButton(shopTab, "Refresh Crate List", function() buildChecklist(getCrateShopFrame, selectedCrates, crateRows) end)
 buildChecklist(getSeedShopFrame, selectedSeeds, seedRows)
 
+-- Pet Tab
 win:AddLabel(petTab, "Wild Pet Auto-Tame")
-win:AddToggle(petTab, "Auto-Tame Pets", AUTO_PETS, function(v) AUTO_PETS = v end)
+local _, getAutoPets, setAutoPets = win:AddToggle(petTab, "Auto-Tame Pets", AUTO_PETS, function(v) AUTO_PETS = v end)
 
 local petRows = {}
 local function refreshPetNames()
@@ -892,7 +1054,88 @@ end
 win:AddLabel(petTab, "Filter by Name")
 win:AddButton(petTab, "Refresh Pet Names", function() refreshPetNames() end)
 
+-- Visual Tab
 win:AddLabel(visualTab, "Performance")
 win:AddButton(visualTab, "Strip Textures + Particles", function() stripVisuals() end)
 win:AddLabel(visualTab, "Removes decals/textures, smooths parts,")
 win:AddLabel(visualTab, "disables particles/trails/beams/smoke/fire.")
+
+-- Config Tab
+win:AddLabel(configTab, "Save / Load Configs")
+
+local currentConfigName = DEFAULT_CONFIG_NAME
+local configNameBox
+
+local _, configBox = win:AddTextBox(configTab, "Config Name", "default", function(text)
+	currentConfigName = text:gsub("[^%w_-]", ""):sub(1, 32)
+	if currentConfigName == "" then currentConfigName = DEFAULT_CONFIG_NAME end
+end)
+configNameBox = configBox
+configNameBox.Text = currentConfigName
+
+win:AddButton(configTab, "Save Config", function()
+	local name = currentConfigName
+	local success = saveConfig(name)
+	if success then
+		refreshConfigList()
+	end
+end)
+
+win:AddButton(configTab, "Load Config", function()
+	local name = currentConfigName
+	if loadConfig(name) then
+		-- Update all UI toggles to match loaded state
+		setEnabled(enabled)
+		setAutoSell(AUTO_SELL)
+		setAutoCollect(AUTO_COLLECT)
+		setHidePlots(HIDE_OTHER_PLOTS)
+		setAntiAfk(ANTI_AFK)
+		setAutoPets(AUTO_PETS)
+		setAutoBuySeeds(autoBuySeeds)
+		setAutoBuyGear(autoBuyGear)
+		setAutoBuyCrates(autoBuyCrates)
+		-- Refresh shop checklists
+		buildChecklist(getSeedShopFrame, selectedSeeds, seedRows)
+		buildChecklist(getGearShopFrame, selectedGear, gearRows)
+		buildChecklist(getCrateShopFrame, selectedCrates, crateRows)
+		refreshPetNames()
+	end
+end)
+
+win:AddButton(configTab, "Delete Config", function()
+	deleteConfig(currentConfigName)
+	refreshConfigList()
+end)
+
+win:AddLabel(configTab, "Saved Configs")
+local configListLabel = win:AddLabel(configTab, "None")
+
+local function refreshConfigList()
+	local configs = listConfigs()
+	if #configs == 0 then
+		configListLabel.Text = "NONE"
+	else
+		configListLabel.Text = table.concat(configs, ", ")
+	end
+end
+
+win:AddButton(configTab, "Refresh List", function()
+	refreshConfigList()
+end)
+
+-- Auto-load default config on startup
+pcall(function()
+	if loadConfig(DEFAULT_CONFIG_NAME) then
+		setEnabled(enabled)
+		setAutoSell(AUTO_SELL)
+		setAutoCollect(AUTO_COLLECT)
+		setHidePlots(HIDE_OTHER_PLOTS)
+		setAntiAfk(ANTI_AFK)
+		setAutoPets(AUTO_PETS)
+		setAutoBuySeeds(autoBuySeeds)
+		setAutoBuyGear(autoBuyGear)
+		setAutoBuyCrates(autoBuyCrates)
+	end
+end)
+
+refreshConfigList()
