@@ -11,6 +11,83 @@ local TweenService           = game:GetService("TweenService")
 local HttpService            = game:GetService("HttpService")
 
 local player    = Players.LocalPlayer
+
+--==================================================================
+-- EARLY LOADING-SCREEN SKIP  (MUST run before anything that yields)
+--==================================================================
+-- The rest of this script blocks on CharacterAdded:Wait() and require(Networking)
+-- below, which don't return until the game has finished loading -- by which point
+-- the loading screen is already gone. So the skip has to happen HERE, first thing,
+-- before any yield. We read the skip preference directly from the autoload config
+-- file (executor file APIs work immediately, with no dependency on game load).
+do
+	local CONFIG_FOLDER      = "AutoHarvestConfigs"
+	local AUTOLOAD_FILE_PATH = CONFIG_FOLDER .. "/autoload_target.txt"
+
+	local wantSkip = false
+	pcall(function()
+		if isfile and isfile(AUTOLOAD_FILE_PATH) then
+			local name = readfile(AUTOLOAD_FILE_PATH)
+			if name and name ~= "" then
+				local path = CONFIG_FOLDER .. "/" .. name .. ".json"
+				if isfile(path) then
+					local data = game:GetService("HttpService"):JSONDecode(readfile(path))
+					if type(data) == "table" and data.AUTO_SKIP_LOADING then
+						wantSkip = true
+					end
+				end
+			end
+		end
+	end)
+
+	if wantSkip then
+		local getconns = getconnections or get_signal_cons or (getgenv and getgenv().getconnections)
+		local getups   = (debug and debug.getupvalues) or getupvalues
+		local setup    = (debug and debug.setupvalue) or setupvalue
+		local UIS      = game:GetService("UserInputService")
+
+		local function attempt()
+			if not (getconns and setup) then return false end
+			local ok, conns = pcall(getconns, UIS.InputBegan)
+			if not ok or not conns then return false end
+			for _, conn in ipairs(conns) do
+				local fn = conn.Function or conn.Func or conn.fn
+				if typeof(fn) == "function" then
+					-- Match 1: closure lives in the loading-screen script.
+					local sOK, src = pcall(function() return debug.info(fn, "s") end)
+					local looksRight = (sOK and type(src) == "string" and src:lower():find("loading")) and true or false
+					-- Match 2 (fallback): exactly 2 boolean upvalues (u119, u117).
+					local ups
+					if getups then local u; u, ups = pcall(getups, fn); if not u then ups = nil end end
+					if not looksRight and ups then
+						local c, allBool = 0, true
+						for _, v in pairs(ups) do c += 1; if type(v) ~= "boolean" then allBool = false end end
+						looksRight = (c == 2 and allBool)
+					end
+					if looksRight then
+						local set = false
+						local n = (ups and #ups ~= 0) and #ups or 2
+						for i = 1, n do if pcall(setup, fn, i, true) then set = true end end
+						if set then return true end
+					end
+				end
+			end
+			return false
+		end
+
+		task.spawn(function()
+			local deadline = os.clock() + 12
+			while os.clock() < deadline do
+				if attempt() then
+					print("[Skip] Loading screen skipped on join.")
+					break
+				end
+				task.wait(0.1)
+			end
+		end)
+	end
+end
+
 local character = player.Character or player.CharacterAdded:Wait()
 
 --==================================================================
@@ -153,8 +230,6 @@ local function runAutoSkip()
 		end
 	end)
 end
-
-if AUTO_SKIP_LOADING then runAutoSkip() end
 
 --==================================================================
 -- CORE LOGIC
