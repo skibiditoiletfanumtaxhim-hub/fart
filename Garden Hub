@@ -58,9 +58,11 @@ local AUTO_SELL        = false
 local AUTO_COLLECT     = false
 local ANTI_AFK         = false
 local HIDE_OTHER_PLOTS = false
+local AUTO_STEAL       = false
 
 local sweeping   = false
 local collecting = false
+local stealing   = false
 
 local selectedSeeds  = {}
 local selectedGear   = {}
@@ -70,8 +72,17 @@ local autoBuyGear    = false
 local autoBuyCrates  = false
 
 local AUTO_PETS        = false
+local TAME_TELEPORT    = true   -- WildPetTame is distance-checked server-side; teleport is required
 local selectedPetNames = {}
 local selectedRarities = {}
+local selectedStealTargets = {}
+local STEAL_HIGHEST_VALUE = false
+local STAY_IN_CENTER = false
+local STEAL_AMOUNT   = 0
+local taming = false
+local petTaming = false
+local STEAL_HOLD_TIME = 1.0   -- seconds to hold a steal before completing; raise if steals still fail
+local tameDepth = 0
 
 track(player.Idled:Connect(function()
 	if not (running and ANTI_AFK) then return end
@@ -111,16 +122,48 @@ local function getMyGarden()
 	return nil
 end
 
+local function getGardenCenterCFrame()
+	local garden = getMyGarden()
+	if not garden then return nil end
+
+	local ref = garden:FindFirstChild("PlotSizeReference", true)
+	if ref and ref:IsA("BasePart") then
+		return CFrame.new(ref.Position + Vector3.new(0, 3, 0))
+	end
+
+	-- Fallback if the reference part is missing.
+	return CFrame.new(garden:GetPivot().Position + Vector3.new(0, 3, 0))
+end
+
+-- When Stay in Center is on, every teleport returns you to your garden's
+-- center instead of wherever you happened to be standing.
+local function getReturnCFrame(savedCFrame)
+	if STAY_IN_CENTER then
+		local center = getGardenCenterCFrame()
+		if center then return center end
+	end
+	return savedCFrame
+end
+
+local function getOtherGardens()
+	local gardens = Workspace:FindFirstChild("Gardens")
+	if not gardens then return {} end
+	local list = {}
+	for _, model in ipairs(gardens:GetChildren()) do
+		if model:GetAttribute("Owner") ~= player.Name then
+			table.insert(list, model)
+		end
+	end
+	return list
+end
+
 local function activateHarvestPrompts()
 	local garden = getMyGarden();
 	if not garden then return end
 	local plants = garden:FindFirstChild("Plants");  if not plants then return end
 
-	-- The game uses StreamingEnabled, so when you walk away from the garden the
-	-- plant/fruit instances get unloaded on your client and this loop finds
-	-- almost nothing to collect (the "super slow when far" symptom). Ask the
-	-- engine to stream the garden in around its position WITHOUT moving the
-	-- character. This is a no-op if streaming is off, so it's always safe.
+	-- StreamingEnabled unloads distant plants/fruits; stream them in around the
+	-- garden WITHOUT moving the character (no-op if streaming is off).
 	pcall(function()
 		local pos = garden:GetPivot().Position
 		player:RequestStreamAroundAsync(pos)
@@ -165,9 +208,9 @@ local function collectSeedPacks()
 				hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
 				task.wait(TP_SETTLE)
 				firePrompt(obj)
-				if RETURN_TO_START then
+				if RETURN_TO_START or STAY_IN_CENTER then
 					task.wait(TP_SETTLE)
-					hrp.CFrame = startCFrame
+					hrp.CFrame = getReturnCFrame(startCFrame)
 				end
 			end
 		end
@@ -245,9 +288,196 @@ local function setOtherPlotsHidden(hide)
 end
 
 --==================================================================
+-- AUTO STEAL LOGIC
+--==================================================================
+local function isOwnerInGarden(garden)
+	local ownerName = garden:GetAttribute("Owner")
+	if not ownerName then return false end
+	local ownerPlayer = Players:FindFirstChild(ownerName)
+	if not ownerPlayer or not ownerPlayer.Character then return false end
+	local ownerHRP = ownerPlayer.Character:FindFirstChild("HumanoidRootPart")
+	if not ownerHRP then return false end
+	local gardenPos = garden:GetPivot().Position
+	return (ownerHRP.Position - gardenPos).Magnitude < 120
+end
+
+local FruitValueCalc = nil
+pcall(function()
+	FruitValueCalc = require(ReplicatedStorage.SharedModules.FruitValueCalc)
+end)
+
+local function getFruitValue(fruit)
+	if not FruitValueCalc then return 0 end
+	local fruitName = fruit:GetAttribute("FruitName")
+		or fruit:GetAttribute("Name")
+		or fruit.Name
+	if not fruitName then return 0 end
+	local ok, val = pcall(FruitValueCalc, fruitName,
+		fruit:GetAttribute("SizeMultiplier"),
+		fruit:GetAttribute("Mutation"),
+		player,
+		fruit:GetAttribute("DecayAlpha")
+	)
+	return (ok and type(val) == "number") and val or 0
+end
+
+local function collectStealTargets()
+	local targets = {}
+	for _, garden in ipairs(getOtherGardens()) do
+		local ownerName = garden:GetAttribute("Owner")
+		-- If highest value mode, ignore player filter and owner-present check happens per fruit
+		if not STEAL_HIGHEST_VALUE then
+			if not selectedStealTargets[ownerName] then continue end
+			if isOwnerInGarden(garden) then
+				print("[AutoSteal] Skipping " .. ownerName .. " - owner present.")
+				continue
+			end
+		end
+
+		local plants = garden:FindFirstChild("Plants")
+		if not plants then continue end
+
+		for _, plant in ipairs(plants:GetChildren()) do
+			local fruits = plant:FindFirstChild("Fruits")
+			if not fruits then continue end
+
+			for _, fruit in ipairs(fruits:GetChildren()) do
+				local harvestPart = fruit:FindFirstChild("HarvestPart")
+				if not harvestPart then continue end
+
+				local prompt
+				for _, desc in ipairs(harvestPart:GetDescendants()) do
+					if desc:IsA("ProximityPrompt") and desc:HasTag("StealPrompt") then
+						prompt = desc
+						break
+					end
+				end
+				if not prompt or not prompt.Enabled then continue end
+
+				local userId  = tonumber(fruit:GetAttribute("UserId"))
+					or tonumber(plant:GetAttribute("UserId"))
+					or tonumber(garden:GetAttribute("UserId"))
+				local plantId = fruit:GetAttribute("PlantId") or plant:GetAttribute("PlantId")
+				local fruitId = fruit:GetAttribute("FruitId")
+				if not userId or not plantId then continue end
+
+				table.insert(targets, {
+					garden     = garden,
+					ownerName  = ownerName,
+					fruit      = fruit,
+					harvestPart = harvestPart,
+					prompt     = prompt,
+					userId     = userId,
+					plantId    = plantId,
+					fruitId    = fruitId,
+					value      = getFruitValue(fruit),
+				})
+			end
+		end
+	end
+
+	if STEAL_HIGHEST_VALUE then
+		table.sort(targets, function(a, b) return a.value > b.value end)
+	end
+
+	return targets
+end
+
+-- Where stolen fruit gets banked. You confirmed PlotSizeReference is the spot,
+-- which is exactly what getGardenCenterCFrame already returns.
+local function getDepositCFrame()
+	return getGardenCenterCFrame()
+end
+
+local function doAutoSteal()
+	if stealing then return end
+
+	local nightVal = ReplicatedStorage:FindFirstChild("Night")
+	if not nightVal or nightVal.Value ~= true then
+		print("[AutoSteal] Not night time, skipping.")
+		return
+	end
+
+	stealing = true
+	local hrp = getHRP()
+	if not hrp then stealing = false return end
+
+	local targets = collectStealTargets()
+	print(string.format("[AutoSteal] Found %d stealable fruits.", #targets))
+	local stolen = 0
+
+	for _, t in ipairs(targets) do
+		if not (running and AUTO_STEAL) then break end
+
+		-- Skip if prompt is gone (already stolen by someone else)
+		if not t.prompt or not t.prompt.Enabled or not t.prompt:IsDescendantOf(Workspace) then
+			continue
+		end
+
+		-- In highest value mode, check owner presence per fruit
+		if STEAL_HIGHEST_VALUE and isOwnerInGarden(t.garden) then
+			print("[AutoSteal] Skipping fruit - owner " .. t.ownerName .. " is in their garden.")
+			continue
+		end
+
+		-- In target mode, re-check owner hasn't walked in
+		if not STEAL_HIGHEST_VALUE and isOwnerInGarden(t.garden) then
+			print("[AutoSteal] Owner " .. t.ownerName .. " entered garden, skipping remaining fruits.")
+			continue
+		end
+
+		local origin = hrp.CFrame
+		hrp.CFrame = CFrame.new(t.harvestPart.Position + Vector3.new(0, 3, 0))
+		task.wait(TP_SETTLE)
+
+		local stealConfirmed = false
+		local conn = Networking.Steal.StealStarted.OnClientEvent:Connect(function()
+			stealConfirmed = true
+		end)
+
+		pcall(function()
+			Networking.Steal.BeginSteal:Fire(t.userId, t.plantId, t.fruitId or "")
+		end)
+
+		local waited = 0
+		while not stealConfirmed and waited < 2 do
+			task.wait(0.1)
+			waited += 0.1
+		end
+		conn:Disconnect()
+
+		if stealConfirmed then
+			-- Hold the steal so the server channels it, THEN complete.
+			task.wait(STEAL_HOLD_TIME)
+			pcall(function() Networking.Steal.CompleteSteal:Fire() end)
+			task.wait(0.3)               -- let the completion resolve before moving
+			stolen += 1
+			if STEAL_AMOUNT > 0 and stolen >= STEAL_AMOUNT then
+				break                    -- deposit happens after the loop
+			end
+		else
+			print("[AutoSteal] No StealStarted within 2s for " .. tostring(t.ownerName) .. " - cancelling.")
+			pcall(function() Networking.Steal.CancelSteal:Fire() end)
+		end
+
+		task.wait(0.1)
+	end
+
+	local h = getHRP()
+	local depositCFrame = getDepositCFrame()
+	if h and depositCFrame then
+		h.CFrame = depositCFrame
+		task.wait(0.6)   -- stand in the deposit zone long enough to bank
+	end
+	if STEAL_AMOUNT > 0 then
+		print(string.format("[AutoSteal] Batch complete: stole %d fruit(s).", stolen))
+	end
+
+	stealing = false
+end
+
+--==================================================================
 -- CONFIG SYSTEM
--- (Defined AFTER the state variables and setOtherPlotsHidden so that
---  save/load capture the real locals as upvalues instead of nil globals.)
 --==================================================================
 local CONFIG_FOLDER = "AutoHarvestConfigs"
 local DEFAULT_CONFIG_NAME = "default"
@@ -272,6 +502,8 @@ local function saveConfig(name)
         ANTI_AFK = ANTI_AFK,
         HIDE_OTHER_PLOTS = HIDE_OTHER_PLOTS,
         AUTO_PETS = AUTO_PETS,
+        TAME_TELEPORT = TAME_TELEPORT,
+        AUTO_STEAL = AUTO_STEAL,
         autoBuySeeds = autoBuySeeds,
         autoBuyGear = autoBuyGear,
         autoBuyCrates = autoBuyCrates,
@@ -284,6 +516,10 @@ local function saveConfig(name)
         selectedGear = selectedGear,
         selectedCrates = selectedCrates,
         selectedPetNames = selectedPetNames,
+        selectedStealTargets = selectedStealTargets,
+		STEAL_HIGHEST_VALUE = STEAL_HIGHEST_VALUE,
+		STAY_IN_CENTER = STAY_IN_CENTER,
+        STEAL_AMOUNT = STEAL_AMOUNT,
     }
     local success, err = pcall(function()
         writefile(getConfigPath(name), HttpService:JSONEncode(config))
@@ -311,7 +547,6 @@ local function loadConfig(name)
         return false
     end
 
-    -- Apply config values
     if result.enabled ~= nil then enabled = result.enabled end
     if result.AUTO_SELL ~= nil then AUTO_SELL = result.AUTO_SELL end
     if result.AUTO_COLLECT ~= nil then AUTO_COLLECT = result.AUTO_COLLECT end
@@ -321,6 +556,8 @@ local function loadConfig(name)
         setOtherPlotsHidden(HIDE_OTHER_PLOTS)
     end
     if result.AUTO_PETS ~= nil then AUTO_PETS = result.AUTO_PETS end
+    if result.TAME_TELEPORT ~= nil then TAME_TELEPORT = result.TAME_TELEPORT end
+    if result.AUTO_STEAL ~= nil then AUTO_STEAL = result.AUTO_STEAL end
     if result.autoBuySeeds ~= nil then autoBuySeeds = result.autoBuySeeds end
     if result.autoBuyGear ~= nil then autoBuyGear = result.autoBuyGear end
     if result.autoBuyCrates ~= nil then autoBuyCrates = result.autoBuyCrates end
@@ -333,6 +570,10 @@ local function loadConfig(name)
     if result.selectedGear ~= nil then selectedGear = result.selectedGear end
     if result.selectedCrates ~= nil then selectedCrates = result.selectedCrates end
     if result.selectedPetNames ~= nil then selectedPetNames = result.selectedPetNames end
+    if result.selectedStealTargets ~= nil then selectedStealTargets = result.selectedStealTargets end
+	if result.STEAL_HIGHEST_VALUE ~= nil then STEAL_HIGHEST_VALUE = result.STEAL_HIGHEST_VALUE end
+	if result.STAY_IN_CENTER ~= nil then STAY_IN_CENTER = result.STAY_IN_CENTER end
+    if result.STEAL_AMOUNT ~= nil then STEAL_AMOUNT = result.STEAL_AMOUNT end
 
     print("[Config] Loaded '" .. name .. "'")
     return true
@@ -432,7 +673,6 @@ local function buyAllCrates() buyShop(getCrateShopFrame, Networking.CrateShop.Pu
 local function findWildPetsFolder()
 	local map = Workspace:FindFirstChild("Map")
 	if not map then return nil end
-	-- Try a few likely names; games rename these between updates.
 	return map:FindFirstChild("WildPetSpawns")
 		or map:FindFirstChild("WildPets")
 		or map:FindFirstChild("WildPetSpawn")
@@ -440,7 +680,6 @@ local function findWildPetsFolder()
 		or nil
 end
 
--- Prints the live wild-pet hierarchy so we can confirm names/paths.
 local function debugWildPets()
 	local folder = findWildPetsFolder()
 	if not folder then
@@ -478,51 +717,273 @@ local function petMatchesFilters(model)
 	return selectedPetNames[name] == true
 end
 
--- Tame a wild pet by firing the dedicated remote directly. No proximity
--- prompt, no teleport -- this is what the BuyPrompt ultimately triggers
--- anyway, so we skip straight to it.
+local function findWildPetRefFolder()
+	local map = Workspace:FindFirstChild("Map")
+	return map and map:FindFirstChild("WildPetRef") or nil
+end
+
+-- Resolve a spawn model (which carries the pet type for filtering) to the ref
+-- part in Workspace.Map.WildPetRef that WildPetTame actually wants.
+local function getPetRefPart(model)
+	local refFolder = findWildPetRefFolder()
+	if not refFolder then return nil end
+
+	local _, id = petInfo(model)
+	if id then
+		local exact = refFolder:FindFirstChild("WildPet_" .. id)
+		if exact then return exact end
+		for _, p in ipairs(refFolder:GetChildren()) do
+			if p.Name:find(id, 1, true) then return p end
+		end
+	end
+
+	local modelPart = model:FindFirstChild("RootPart") or model:FindFirstChildWhichIsA("BasePart", true)
+	if modelPart then
+		local best, bestDist
+		for _, p in ipairs(refFolder:GetChildren()) do
+			if p:IsA("BasePart") then
+				local d = (p.Position - modelPart.Position).Magnitude
+				if not bestDist or d < bestDist then best, bestDist = p, d end
+			end
+		end
+		if best and bestDist and bestDist < 30 then return best end
+	end
+	return nil
+end
+
+local function enterTame()
+	tameDepth += 1
+	petTaming = true
+end
+local function exitTame()
+	tameDepth = math.max(0, tameDepth - 1)
+	if tameDepth == 0 then petTaming = false end
+end
+
+-- Per-part cooldown: don't keep teleporting to a pet that won't tame (e.g. full
+-- pet slots). Weak keys so tamed/removed parts clear themselves.
+local tameCooldown = setmetatable({}, { __mode = "k" })
+local TAME_RETRY   = 5
+
+-- Fire WildPetTame on a ref part. WildPetTame is distance-checked server-side,
+-- so if TAME_TELEPORT is on we hop to the pet, fire, and hop back.
+local TAME_WALKSPEED = 60    -- lower = less likely to ram parts; raise if too slow
+local tameWarned = false
+
+local function fireTameAt(part)
+	if not (part and (part:IsA("BasePart") or part:IsA("Model"))) then return end
+
+	local now = os.clock()
+	if (now - (tameCooldown[part] or -math.huge)) < TAME_RETRY then return end
+	tameCooldown[part] = now
+
+	local char = character or player.Character
+	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+	local hum  = char and char:FindFirstChildWhichIsA("Humanoid")
+	if not (hrp and hum) then return end
+
+	taming = true
+	enterTame()
+	petTaming = true
+
+	local pos = part:IsA("BasePart") and part.Position or part:GetPivot().Position
+	local originalSpeed = hum.WalkSpeed
+
+	-- Disable collisions on the character so we don't ram parts and get flung.
+	local restoreCollide = {}
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("BasePart") and d.CanCollide then
+			restoreCollide[d] = true
+			d.CanCollide = false
+		end
+	end
+
+	hum.WalkSpeed = TAME_WALKSPEED
+
+	local arrived = false
+	local conn = hum.MoveToFinished:Connect(function(reached) arrived = reached end)
+	hum:MoveTo(pos)
+
+	local waited = 0
+	while not arrived and waited < 3 do
+		hum:MoveTo(pos)
+		task.wait(0.1)
+		waited += 0.1
+		-- Full 3D distance now, not just horizontal.
+		if (hrp.Position - pos).Magnitude < 10 then arrived = true end
+	end
+	conn:Disconnect()
+
+	-- Fire a few times over ~0.4s while parked, so a single mistimed fire
+	-- doesn't make us miss the pet.
+	for _ = 1, 4 do
+		pcall(function() Networking.Pets.WildPetTame:Fire(part) end)
+		task.wait(0.1)
+	end
+
+	-- Restore collisions.
+	for d in pairs(restoreCollide) do
+		if d and d.Parent then d.CanCollide = true end
+	end
+
+	hum.WalkSpeed = originalSpeed
+	taming = false
+	exitTame()
+	petTaming = false
+end
+
 local function tameWildPet(model)
-	pcall(function()
-		Networking.Pets.WildPetTame:Fire(model)
-	end)
+	fireTameAt(getPetRefPart(model))
 end
 
 local function autoTamePets()
-	local folder = findWildPetsFolder()
-	if not folder then return end
-	for _, model in ipairs(folder:GetChildren()) do
+	local refFolder = findWildPetRefFolder()
+	if not refFolder then return end
+	enterTame()
+
+	if next(selectedPetNames) == nil then
+		for _, part in ipairs(refFolder:GetChildren()) do
+			if not (running and AUTO_PETS) then break end
+			fireTameAt(part)
+		end
+		exitTame()
+		return
+	end
+
+	local spawnFolder = findWildPetsFolder()
+	if not spawnFolder then exitTame() return end
+	for _, model in ipairs(spawnFolder:GetChildren()) do
 		if not (running and AUTO_PETS) then break end
 		if (model:IsA("Model") or model:IsA("Folder")) and petMatchesFilters(model) then
 			tameWildPet(model)
-			task.wait() -- small yield so a big batch doesn't fire all in one frame
 		end
 	end
+	exitTame()
 end
 
--- One-shot tester: fires WildPetTame on the first matching pet and reports,
--- so we can confirm the remote argument is correct without the loop running.
 local function testTameFirstPet()
 	local folder = findWildPetsFolder()
 	if not folder then warn("[Pets] No wild pet folder found.") return end
 	for _, model in ipairs(folder:GetChildren()) do
 		if (model:IsA("Model") or model:IsA("Folder")) and petMatchesFilters(model) then
 			local name = petInfo(model)
-			print("[Pets] Firing WildPetTame on: " .. model.Name .. "  (name=" .. tostring(name) .. ")")
-			local ok, err = pcall(function() Networking.Pets.WildPetTame:Fire(model) end)
-			if ok then
-				print("[Pets] Fired OK. If nothing happened, the remote may want the pet id string instead of the model -- tell me and I'll switch it.")
-			else
-				warn("[Pets] Fire errored: " .. tostring(err) .. "  (likely wrong argument type; the id string is the alternative.)")
+			local refPart = getPetRefPart(model)
+			if not refPart then
+				warn("[Pets] Couldn't find a WildPetRef part for " .. model.Name)
+				return
 			end
+			print("[Pets] Taming " .. tostring(name) .. " via " .. refPart:GetFullName()
+				.. (TAME_TELEPORT and "  (teleport ON)" or "  (teleport OFF)"))
+			tameCooldown[refPart] = nil -- allow an immediate manual test
+			task.spawn(function() fireTameAt(refPart) end)
 			return
 		end
 	end
 	warn("[Pets] No matching wild pets to test on.")
 end
 
+local captureInstalled = false
+local CAPTURE_DENYLIST = {
+	["Garden.CollectFruit"] = true,
+	["SeedShop.PurchaseSeed"] = true,
+	["GearShop.PurchaseGear"] = true,
+	["CrateShop.PurchaseCrate"] = true,
+	["NPCS.SellAll"] = true,
+	["ObjectPositionService.CreateServerValue"] = true,
+    ["Steal.BeginSteal"] = true,
+}
+
+local function describeArg(i, v)
+	local t = typeof(v)
+	if t == "Instance" then
+		return string.format("[%d] Instance(%s) = %s", i, v.ClassName, v:GetFullName())
+	elseif t == "table" then
+		local ok, encoded = pcall(function() return HttpService:JSONEncode(v) end)
+		return string.format("[%d] table = %s", i, ok and encoded or "<unencodable table>")
+	else
+		return string.format("[%d] %s = %s", i, t, tostring(v))
+	end
+end
+
+local captureLastPrint = {}
+local captureKeywords = nil
+local function labelMatchesFilter(label)
+	if not captureKeywords then return true end
+	local low = label:lower()
+	for _, kw in ipairs(captureKeywords) do
+		if low:find(kw, 1, true) then return true end
+	end
+	return false
+end
+
+local function wrapRemoteFire(label, remote)
+	local orig = remote.Fire
+	if type(orig) ~= "function" then return end
+	remote.Fire = function(selfRef, ...)
+		if not CAPTURE_DENYLIST[label] and labelMatchesFilter(label) then
+			local now = os.clock()
+			if (now - (captureLastPrint[label] or -math.huge)) >= 1 then
+				captureLastPrint[label] = now
+				local n = select("#", ...)
+				local parts = {}
+				for i = 1, n do
+					parts[i] = describeArg(i, (select(i, ...)))
+				end
+				pcall(function()
+					print("[CAPTURE] " .. label .. ":Fire(" .. table.concat(parts, ", ") .. ")")
+				end)
+			end
+		end
+		return orig(selfRef, ...)
+	end
+end
+
+local function installCapture(focused)
+	captureKeywords = focused and { "pet", "tame", "wild", "steal" } or nil
+
+	if captureInstalled then
+		print("[Capture] Filter set to: " .. (focused and "PET/STEAL-ONLY" or "everything"))
+		return
+	end
+	captureInstalled = true
+	local count = 0
+	for serviceName, service in pairs(Networking) do
+		if type(service) == "table" then
+			if type(service.Fire) == "function" and service.Id ~= nil then
+				wrapRemoteFire(serviceName, service); count += 1
+			else
+				for remoteName, remote in pairs(service) do
+					if type(remote) == "table" and type(remote.Fire) == "function" then
+						wrapRemoteFire(serviceName .. "." .. remoteName, remote); count += 1
+					end
+				end
+			end
+		end
+	end
+	print(string.format("[Capture] Installed on %d remotes. Filter: %s", count, focused and "FOCUSED" or "everything"))
+end
+
 --==================================================================
 -- LOOPS
 --==================================================================
+
+task.spawn(function()
+	while running do
+		task.wait(0.3)
+		if running and STAY_IN_CENTER
+			and not stealing and not collecting and not petTaming and not taming then
+			local hrp = getHRP()
+			local center = getGardenCenterCFrame()
+			if hrp and center then
+				local d = hrp.Position - center.Position
+				if Vector3.new(d.X, 0, d.Z).Magnitude > 8 then
+					hrp.CFrame = center
+				end
+			end
+		end
+	end
+end)
+
 task.spawn(function()
 	while running do
 		task.wait(LOOP_INTERVAL)
@@ -578,8 +1039,18 @@ end)
 task.spawn(function()
 	while running do
 		task.wait(0.6)
-		if running and AUTO_PETS then
+		if running and AUTO_PETS and not petTaming then
 			pcall(autoTamePets)
+		end
+	end
+end)
+
+-- Steal Loop
+task.spawn(function()
+	while running do
+		task.wait(2)
+		if running and AUTO_STEAL and not stealing then
+			pcall(doAutoSteal)
 		end
 	end
 end)
@@ -651,7 +1122,7 @@ function Library.new(title)
 	self.gui = gui
 
 	local main = Instance.new("Frame")
-	main.Size              = UDim2.fromOffset(420, 360)
+	main.Size = UDim2.fromOffset(420, 0)
 	main.Position          = UDim2.new(0, 40, 0.5, -180)
 	main.BackgroundColor3  = Theme.BG
 	main.BorderSizePixel   = 0
@@ -662,7 +1133,7 @@ function Library.new(title)
 	self.main = main
 
 	main.Size = UDim2.fromOffset(420, 0)
-	tw(main, TW_MED, { Size = UDim2.fromOffset(420, 360) })
+	tw(main, TW_MED, { Size = UDim2.fromOffset(420, 500) })
 
 	local header = Instance.new("Frame")
 	header.Size             = UDim2.new(1, 0, 0, 46)
@@ -719,11 +1190,16 @@ function Library.new(title)
 		unloadEverything()
 	end))
 
-	local tabBar = Instance.new("Frame")
-	tabBar.Size             = UDim2.new(1, -20, 0, 34)
-	tabBar.Position         = UDim2.fromOffset(10, 54)
+	local tabBar = Instance.new("ScrollingFrame")
+	tabBar.Size                 = UDim2.new(1, -20, 0, 34)
+	tabBar.Position             = UDim2.fromOffset(10, 54)
 	tabBar.BackgroundTransparency = 1
-	tabBar.Parent           = main
+	tabBar.BorderSizePixel      = 0
+	tabBar.ScrollBarThickness   = 0  -- hidden scrollbar, swipe/scroll to navigate
+	tabBar.CanvasSize           = UDim2.new(0, 0, 0, 0)
+	tabBar.AutomaticCanvasSize  = Enum.AutomaticSize.X
+	tabBar.ScrollingDirection   = Enum.ScrollingDirection.X
+	tabBar.Parent               = main
 	self.tabBar = tabBar
 
 	local tabLayout = Instance.new("UIListLayout")
@@ -733,7 +1209,7 @@ function Library.new(title)
 	tabLayout.Parent        = tabBar
 
 	content = Instance.new("Frame")
-	content.Size             = UDim2.new(1, -20, 1, -100)
+	content.Size             = UDim2.new(1, -20, 1, -98)
 	content.Position        = UDim2.fromOffset(10, 94)
 	content.BackgroundColor3 = Theme.Panel
 	content.BorderSizePixel  = 0
@@ -775,7 +1251,7 @@ end
 
 function Library:AddTab(name)
 	local btn = Instance.new("TextButton")
-	btn.Size             = UDim2.new(0, 78, 1, 0)
+	btn.Size = UDim2.new(0, 68, 1, 0)
 	btn.BackgroundColor3 = Theme.Tab
 	btn.BorderSizePixel  = 0
 	btn.AutoButtonColor  = false
@@ -1019,6 +1495,7 @@ local win = Library.new("Garden Hub")
 local farmTab   = win:AddTab("Farm")
 local shopTab   = win:AddTab("Shop")
 local petTab    = win:AddTab("Pets")
+local stealTab  = win:AddTab("Steal")
 local visualTab = win:AddTab("Visuals")
 local configTab = win:AddTab("Config")
 
@@ -1029,6 +1506,7 @@ local _, getAutoSell, setAutoSell = win:AddToggle(farmTab, "Auto Sell (at full)"
 local _, getAutoCollect, setAutoCollect = win:AddToggle(farmTab, "Auto Collect Seeds", AUTO_COLLECT, function(v) AUTO_COLLECT = v end)
 local _, getHidePlots, setHidePlots = win:AddToggle(farmTab, "Hide Other Plots", HIDE_OTHER_PLOTS, function(v) HIDE_OTHER_PLOTS = v; setOtherPlotsHidden(v) end)
 local _, getAntiAfk, setAntiAfk = win:AddToggle(farmTab, "Anti-AFK", ANTI_AFK, function(v) ANTI_AFK = v end)
+local _, getStayCenter, setStayCenter = win:AddToggle(farmTab, "Stay in Center", STAY_IN_CENTER, function(v) STAY_IN_CENTER = v end)
 
 -- Shop Tab
 win:AddLabel(shopTab, "Buy All (in-stock)")
@@ -1074,6 +1552,8 @@ buildChecklist(getSeedShopFrame, selectedSeeds, seedRows)
 -- Pet Tab
 win:AddLabel(petTab, "Wild Pet Auto-Tame")
 local _, getAutoPets, setAutoPets = win:AddToggle(petTab, "Auto-Tame Pets", AUTO_PETS, function(v) AUTO_PETS = v end)
+local _, getTameTp, setTameTp = win:AddToggle(petTab, "Fast Tame (teleport to pet)", TAME_TELEPORT, function(v) TAME_TELEPORT = v end)
+win:AddLabel(petTab, "Teleport is required - taming is distance-checked.")
 
 local petRows = {}
 local function refreshPetNames()
@@ -1097,10 +1577,66 @@ local function refreshPetNames()
 		petRows[#petRows+1] = win:AddLabel(petTab, "No wild pets found right now.")
 	end
 end
-win:AddLabel(petTab, "Filter by Name")
+win:AddLabel(petTab, "Filter by Name (leave empty = tame all)")
 win:AddButton(petTab, "Refresh Pet Names", function() refreshPetNames() end)
-win:AddButton(petTab, "Debug Pets (check output)", function() debugWildPets() end)
 win:AddButton(petTab, "Test Tame First Pet", function() testTameFirstPet() end)
+win:AddButton(petTab, "Debug Pets (check output)", function() debugWildPets() end)
+win:AddButton(petTab, "Capture Pet Calls Only (then tame)", function() installCapture(true) end)
+win:AddButton(petTab, "Capture ALL Calls (then tame)", function() installCapture(false) end)
+win:AddButton(petTab, "Test Ref Folder", function()
+	local refFolder = findWildPetRefFolder()
+	if not refFolder then
+		warn("[Pets] WildPetRef folder NOT found.")
+		local map = Workspace:FindFirstChild("Map")
+		if map then for _,c in ipairs(map:GetChildren()) do print("  Map >", c.Name, c.ClassName) end end
+		return
+	end
+	print("[Pets] Found:", refFolder:GetFullName())
+	local kids = refFolder:GetChildren()
+	print("[Pets] ref parts:", #kids)
+	for i,p in ipairs(kids) do
+		if i > 3 then break end
+		print(string.format("  [%d] %s (%s)", i, p.Name, p.ClassName))
+		print("       tame fired ->", p:GetFullName())
+		fireTameAt(p)
+	end
+end)
+
+-- Steal Tab
+win:AddLabel(stealTab, "Auto Steal")
+local _, getAutoSteal, setAutoSteal = win:AddToggle(stealTab, "Auto Steal (Selected Targets)", AUTO_STEAL, function(v) AUTO_STEAL = v end)
+win:AddButton(stealTab, "Complete Steal", function() pcall(function() Networking.Steal.CompleteSteal:Fire() end) end)
+win:AddButton(stealTab, "Cancel Steal", function() pcall(function() Networking.Steal.CancelSteal:Fire() end) end)
+
+local stealRows = {}
+local function refreshStealTargets()
+	for _, row in ipairs(stealRows) do row:Destroy() end
+	table.clear(stealRows)
+	local gardens = getOtherGardens()
+	local seen = {}
+	for _, garden in ipairs(gardens) do
+		local ownerName = garden:GetAttribute("Owner")
+		if ownerName and not seen[ownerName] then
+			seen[ownerName] = true
+			local row = win:AddCheck(stealTab, ownerName, selectedStealTargets[ownerName] == true, function(on)
+				selectedStealTargets[ownerName] = on or nil
+			end)
+			stealRows[#stealRows+1] = row
+		end
+	end
+	if #stealRows == 0 then
+		stealRows[#stealRows+1] = win:AddLabel(stealTab, "No other player gardens found nearby.")
+	end
+end
+win:AddLabel(stealTab, "Target Selection")
+win:AddButton(stealTab, "Refresh Targets", function() refreshStealTargets() end)
+refreshStealTargets()
+
+local _, stealAmountBox = win:AddTextBox(stealTab, "Steal Amount (0 = all)", "0", function(text)
+	local n = tonumber(text)
+	STEAL_AMOUNT = (n and n >= 0) and math.floor(n) or 0
+	print("[AutoSteal] Steal amount = " .. (STEAL_AMOUNT == 0 and "ALL" or tostring(STEAL_AMOUNT)))
+end)
 
 -- Visual Tab
 win:AddLabel(visualTab, "Performance")
@@ -1110,12 +1646,13 @@ win:AddLabel(visualTab, "disables particles/trails/beams/smoke/fire.")
 
 -- Config Tab
 win:AddLabel(configTab, "Save / Load Configs")
+local _, getStealHighest, setStealHighest = win:AddToggle(stealTab, "Steal Highest Value First", STEAL_HIGHEST_VALUE, function(v)
+	STEAL_HIGHEST_VALUE = v
+end)
 
 local currentConfigName = DEFAULT_CONFIG_NAME
 local configNameBox
 
--- Forward-declare so the Save/Delete button callbacks below capture the
--- real function as an upvalue instead of a nil global.
 local refreshConfigList
 
 local _, configBox = win:AddTextBox(configTab, "Config Name", "default", function(text)
@@ -1132,6 +1669,8 @@ local function applyLoadedStateToUI()
 	setHidePlots(HIDE_OTHER_PLOTS)
 	setAntiAfk(ANTI_AFK)
 	setAutoPets(AUTO_PETS)
+	setTameTp(TAME_TELEPORT)
+	setAutoSteal(AUTO_STEAL)
 	setAutoBuySeeds(autoBuySeeds)
 	setAutoBuyGear(autoBuyGear)
 	setAutoBuyCrates(autoBuyCrates)
@@ -1139,6 +1678,10 @@ local function applyLoadedStateToUI()
 	buildChecklist(getGearShopFrame, selectedGear, gearRows)
 	buildChecklist(getCrateShopFrame, selectedCrates, crateRows)
 	refreshPetNames()
+    refreshStealTargets()
+	setStealHighest(STEAL_HIGHEST_VALUE)
+	setStayCenter(STAY_IN_CENTER)
+	if stealAmountBox then stealAmountBox.Text = tostring(STEAL_AMOUNT) end
 end
 
 win:AddButton(configTab, "Save Config", function()
@@ -1156,7 +1699,6 @@ win:AddButton(configTab, "Load Config", function()
 	end
 end)
 
--- AUTOLOAD SELECTION BUTTON
 win:AddButton(configTab, "Set as Autoload", function()
 	ensureConfigFolder()
 	local success, err = pcall(function()
@@ -1190,7 +1732,77 @@ win:AddButton(configTab, "Refresh List", function()
 	refreshConfigList()
 end)
 
--- Dynamically check for a saved autoload preference on startup
+win:AddButton(stealTab, "Debug Steal Targets", function()
+	local nightVal = ReplicatedStorage:FindFirstChild("Night")
+	print("[Debug] Night:", nightVal and tostring(nightVal.Value) or "nil")
+	print("[Debug] Other gardens:", #getOtherGardens())
+	for _, garden in ipairs(getOtherGardens()) do
+		local ownerName = garden:GetAttribute("Owner")
+		local plants = garden:FindFirstChild("Plants")
+		local plantCount = plants and #plants:GetChildren() or 0
+		local fruitCount = 0
+		local promptCount = 0
+		if plants then
+			for _, plant in ipairs(plants:GetChildren()) do
+				local fruits = plant:FindFirstChild("Fruits")
+				if fruits then
+					fruitCount += #fruits:GetChildren()
+					for _, fruit in ipairs(fruits:GetChildren()) do
+						local hp = fruit:FindFirstChild("HarvestPart")
+						if hp then
+							for _, d in ipairs(hp:GetDescendants()) do
+								if d:IsA("ProximityPrompt") and d:HasTag("StealPrompt") then
+									promptCount += 1
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		print(string.format("  Garden: %s | plants: %d | fruits: %d | stealPrompts: %d | ownerPresent: %s | inTargets: %s",
+			tostring(ownerName), plantCount, fruitCount, promptCount,
+			tostring(isOwnerInGarden(garden)),
+			tostring(selectedStealTargets[ownerName] == true)
+		))
+	end
+end)
+
+local nightLabel = win:AddLabel(stealTab, "Checking night...")
+task.spawn(function()
+	while running do
+		local nightVal = ReplicatedStorage:FindFirstChild("Night")
+		if nightVal then
+			nightLabel.Text = nightVal.Value and "🌙 IT IS NIGHT - STEAL ACTIVE" or "☀ NOT NIGHT - STEAL WONT WORK"
+		end
+		task.wait(2)
+	end
+end)
+
+win:AddButton(stealTab, "Capture Steal Calls", function()
+    for remoteName, remote in pairs(Networking.Steal) do
+        if type(remote) == "table" and type(remote.Fire) == "function" then
+            local orig = remote.Fire
+            remote.Fire = function(self, ...)
+                local args = {...}
+                local parts = {}
+                for i, v in ipairs(args) do
+                    local t = typeof(v)
+                    if t == "Instance" then
+                        parts[i] = string.format("[%d] Instance(%s) = %s", i, v.ClassName, v:GetFullName())
+                    else
+                        parts[i] = string.format("[%d] %s = %s", i, t, tostring(v))
+                    end
+                end
+                print("[STEAL CAPTURE] Steal." .. remoteName .. ":Fire(" .. table.concat(parts, ", ") .. ")")
+                return orig(self, ...)
+            end
+            print("[STEAL CAPTURE] Hooked Steal." .. remoteName)
+        end
+    end
+    print("[STEAL CAPTURE] Now go manually trigger a steal on someone's garden.")
+end)
+
 pcall(function()
 	local targetConfig = DEFAULT_CONFIG_NAME
 	if isfile(AUTOLOAD_FILE_PATH) then
@@ -1203,7 +1815,6 @@ pcall(function()
 	if loadConfig(targetConfig) then
 		applyLoadedStateToUI()
 
-		-- Sync the UI Textbox to match what was loaded
 		if configNameBox then
 			configNameBox.Text = targetConfig
 			currentConfigName = targetConfig
