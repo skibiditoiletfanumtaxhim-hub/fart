@@ -1,22 +1,94 @@
--- AutoHarvest + Rayfield UI (LocalScript)
+-- AutoHarvest + Custom UI (LocalScript)
 -- StarterPlayer > StarterPlayerScripts
 
-local Players           = game:GetService("Players")
-local Workspace         = game:GetService("Workspace")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService  = game:GetService("UserInputService")
-local VirtualUser       = game:GetService("VirtualUser")
-local TweenService      = game:GetService("TweenService")
-local HttpService       = game:GetService("HttpService")
-local RunService        = game:GetService("RunService")
+local Players                = game:GetService("Players")
+local Workspace              = game:GetService("Workspace")
+local ReplicatedStorage      = game:GetService("ReplicatedStorage")
+local UserInputService       = game:GetService("UserInputService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local VirtualUser            = game:GetService("VirtualUser")
+local TweenService           = game:GetService("TweenService")
+local HttpService            = game:GetService("HttpService")
 
 local player    = Players.LocalPlayer
-local character = player.Character or player.CharacterAdded:Wait()
 
 --==================================================================
--- RAYFIELD LOADER
+-- EARLY LOADING-SCREEN SKIP  (MUST run before anything that yields)
 --==================================================================
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+-- The rest of this script blocks on CharacterAdded:Wait() and require(Networking)
+-- below, which don't return until the game has finished loading -- by which point
+-- the loading screen is already gone. So the skip has to happen HERE, first thing,
+-- before any yield. We read the skip preference directly from the autoload config
+-- file (executor file APIs work immediately, with no dependency on game load).
+do
+	local CONFIG_FOLDER      = "AutoHarvestConfigs"
+	local AUTOLOAD_FILE_PATH = CONFIG_FOLDER .. "/autoload_target.txt"
+
+	local wantSkip = false
+	pcall(function()
+		if isfile and isfile(AUTOLOAD_FILE_PATH) then
+			local name = readfile(AUTOLOAD_FILE_PATH)
+			if name and name ~= "" then
+				local path = CONFIG_FOLDER .. "/" .. name .. ".json"
+				if isfile(path) then
+					local data = game:GetService("HttpService"):JSONDecode(readfile(path))
+					if type(data) == "table" and data.AUTO_SKIP_LOADING then
+						wantSkip = true
+					end
+				end
+			end
+		end
+	end)
+
+	if wantSkip then
+		local getconns = getconnections or get_signal_cons or (getgenv and getgenv().getconnections)
+		local getups   = (debug and debug.getupvalues) or getupvalues
+		local setup    = (debug and debug.setupvalue) or setupvalue
+		local UIS      = game:GetService("UserInputService")
+
+		local function attempt()
+			if not (getconns and setup) then return false end
+			local ok, conns = pcall(getconns, UIS.InputBegan)
+			if not ok or not conns then return false end
+			for _, conn in ipairs(conns) do
+				local fn = conn.Function or conn.Func or conn.fn
+				if typeof(fn) == "function" then
+					-- Match 1: closure lives in the loading-screen script.
+					local sOK, src = pcall(function() return debug.info(fn, "s") end)
+					local looksRight = (sOK and type(src) == "string" and src:lower():find("loading")) and true or false
+					-- Match 2 (fallback): exactly 2 boolean upvalues (u119, u117).
+					local ups
+					if getups then local u; u, ups = pcall(getups, fn); if not u then ups = nil end end
+					if not looksRight and ups then
+						local c, allBool = 0, true
+						for _, v in pairs(ups) do c += 1; if type(v) ~= "boolean" then allBool = false end end
+						looksRight = (c == 2 and allBool)
+					end
+					if looksRight then
+						local set = false
+						local n = (ups and #ups ~= 0) and #ups or 2
+						for i = 1, n do if pcall(setup, fn, i, true) then set = true end end
+						if set then return true end
+					end
+				end
+			end
+			return false
+		end
+
+		task.spawn(function()
+			local deadline = os.clock() + 12
+			while os.clock() < deadline do
+				if attempt() then
+					print("[Skip] Loading screen skipped on join.")
+					break
+				end
+				task.wait(0.1)
+			end
+		end)
+	end
+end
+
+local character = player.Character or player.CharacterAdded:Wait()
 
 --==================================================================
 -- LIFECYCLE / CLEANUP
@@ -25,22 +97,26 @@ local running     = true
 local connections = {}
 
 local function track(conn)
-    table.insert(connections, conn)
-    return conn
+	table.insert(connections, conn)
+	return conn
 end
 
 local function unloadEverything()
-    running = false
-    for _, conn in ipairs(connections) do
-        pcall(function() conn:Disconnect() end)
-    end
-    table.clear(connections)
-    Rayfield:Destroy()
-    print("[AutoHarvest] Unloaded.")
+	running = false
+	for _, conn in ipairs(connections) do
+		pcall(function() conn:Disconnect() end)
+	end
+	table.clear(connections)
+	local g = player:FindFirstChild("PlayerGui")
+	if g then
+		local existing = g:FindFirstChild("CustomHarvestGui")
+		if existing then existing:Destroy() end
+	end
+	print("[AutoHarvest] Unloaded.")
 end
 
 track(player.CharacterAdded:Connect(function(c)
-    character = c
+	character = c
 end))
 
 --==================================================================
@@ -52,54 +128,480 @@ local DO_SEED_PACKS    = true
 local POLL_INTERVAL    = 0.25
 local COLLECT_INTERVAL = 0.4
 local RETURN_TO_START  = true
-local TP_SETTLE        = 0.05
-local STEAL_HOLD_TIME  = 0.5
+local TP_SETTLE        = 0.03
 
-local enabled           = false
-local AUTO_SELL         = false
-local AUTO_COLLECT      = false
-local ANTI_AFK          = false
-local HIDE_OTHER_PLOTS  = false
-local AUTO_STEAL        = false
+local enabled          = false
+local AUTO_SELL        = false
+local AUTO_COLLECT     = false
+local ANTI_AFK         = false
+local HIDE_OTHER_PLOTS = false
+local AUTO_STEAL       = false
 local AUTO_SKIP_LOADING = false
-local STAY_IN_CENTER    = false
-local STEAL_HIGHEST_VALUE = false
-local STEAL_AMOUNT      = 0
 
 local sweeping   = false
 local collecting = false
 local stealing   = false
-local taming     = false
 
-local selectedSeeds        = {}
-local selectedGear         = {}
-local selectedCrates       = {}
-local autoBuySeeds         = false
-local autoBuyGear          = false
-local autoBuyCrates        = false
-local AUTO_PETS            = false
-local TAME_TELEPORT        = true
-local selectedPetNames     = {}
-local knownPetNames        = {}
+local selectedSeeds  = {}
+local selectedGear   = {}
+local selectedCrates = {}
+local autoBuySeeds   = false
+local autoBuyGear    = false
+local autoBuyCrates  = false
+
+local AUTO_PETS        = false
+local TAME_TELEPORT    = true   -- WildPetTame is distance-checked server-side; teleport is required
+local selectedPetNames = {}
+local knownPetNames    = {}     -- [name] = true -- persistent master roster of selectable pets
+local selectedRarities = {}
 local selectedStealTargets = {}
+local STEAL_HIGHEST_VALUE = false
+local STAY_IN_CENTER = false
+local STEAL_AMOUNT   = 0
+local taming = false
+local petTaming = false
+local STEAL_HOLD_TIME = 0.4   -- seconds between BeginSteal and CompleteSteal; raise if steals fail, lower for speed
+local tameDepth = 0
 
 track(player.Idled:Connect(function()
-    if not (running and ANTI_AFK) then return end
-    VirtualUser:CaptureController()
-    VirtualUser:ClickButton2(Vector2.new())
+	if not (running and ANTI_AFK) then return end
+	VirtualUser:CaptureController()
+	VirtualUser:ClickButton2(Vector2.new())
 end))
 
 local Networking = require(ReplicatedStorage.SharedModules.Networking)
 
+--==================================================================
+-- AUTO SKIP LOADING SCREEN  (no remote -- the skip is purely client-side)
+--==================================================================
+-- ReplicatedFirst.LoadingScreenController gates its skip on two local boolean
+-- upvalues of a UserInputService.InputBegan connection: u119 ("can skip now")
+-- and u117 ("skip pressed"). Setting both true makes the controller run its own
+-- proper teardown (unanchor character, re-enable prompts, restore other GUIs),
+-- which is far safer than just destroying the loading GUI ourselves.
+local getconns = getconnections or get_signal_cons or (getgenv and getgenv().getconnections)
+local getups   = (debug and debug.getupvalues) or getupvalues
+local setup    = (debug and debug.setupvalue) or setupvalue
+
+local function trySkipLoadingScreen()
+	if not (getconns and setup) then
+		warn("[Skip] Executor lacks getconnections/setupvalue - cannot skip.")
+		return false
+	end
+	local ok, conns = pcall(getconns, UserInputService.InputBegan)
+	if not ok or not conns then return false end
+
+	for _, conn in ipairs(conns) do
+		local fn = conn.Function or conn.Func or conn.fn
+		if typeof(fn) == "function" then
+			-- Match 1: closure lives in the loading-screen script.
+			local sOK, src = pcall(function() return debug.info(fn, "s") end)
+			local looksRight = (sOK and type(src) == "string" and src:lower():find("loading")) and true or false
+
+			-- Match 2 (fallback): closure has exactly 2 boolean upvalues (u119, u117).
+			local ups
+			if getups then local u; u, ups = pcall(getups, fn); if not u then ups = nil end end
+			if not looksRight and ups then
+				local c, allBool = 0, true
+				for _, v in pairs(ups) do c += 1; if type(v) ~= "boolean" then allBool = false end end
+				looksRight = (c == 2 and allBool)
+			end
+
+			if looksRight then
+				local set = false
+				local n = (ups and #ups ~= 0) and #ups or 2
+				for i = 1, n do if pcall(setup, fn, i, true) then set = true end end
+				if set then print("[Skip] Loading screen skip flags set."); return true end
+			end
+		end
+	end
+	return false
+end
+
+-- The skip only matters while the controller is still running (i.e. right after
+-- joining). StarterPlayerScripts can start a hair before the loading GUI exists,
+-- so retry for a few seconds. Most useful when this is in your autoload config.
+local function runAutoSkip()
+	task.spawn(function()
+		local deadline = os.clock() + 8
+		while running and AUTO_SKIP_LOADING and os.clock() < deadline do
+			if trySkipLoadingScreen() then break end
+			task.wait(0.1)
+		end
+	end)
+end
+
+--==================================================================
+-- CORE LOGIC
+--==================================================================
+local function firePrompt(prompt)
+	if not prompt or not prompt:IsA("ProximityPrompt") then return end
+	if not prompt.Enabled then return end
+	if prompt.ActionText == "" and prompt.ObjectText == "" then return end
+	pcall(function()
+		prompt.MaxActivationDistance = math.huge
+		prompt.RequiresLineOfSight   = false
+		prompt.HoldDuration          = 0
+		prompt:InputHoldBegin()
+		prompt:InputHoldEnd()
+	end)
+end
+
+local function getHRP()
+	local char = character or player.Character
+	return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function getMyGarden()
+	local gardens = Workspace:FindFirstChild("Gardens")
+	if not gardens then return nil end
+	for _, model in ipairs(gardens:GetChildren()) do
+		if model:GetAttribute("Owner") == player.Name then return model end
+	end
+	return nil
+end
+
+local function getGardenCenterCFrame()
+	local garden = getMyGarden()
+	if not garden then return nil end
+
+	local ref = garden:FindFirstChild("PlotSizeReference", true)
+	if ref and ref:IsA("BasePart") then
+		return CFrame.new(ref.Position + Vector3.new(0, 3, 0))
+	end
+
+	-- Fallback if the reference part is missing.
+	return CFrame.new(garden:GetPivot().Position + Vector3.new(0, 3, 0))
+end
+
+-- When Stay in Center is on, every teleport returns you to your garden's
+-- center instead of wherever you happened to be standing.
+local function getReturnCFrame(savedCFrame)
+	if STAY_IN_CENTER then
+		local center = getGardenCenterCFrame()
+		if center then return center end
+	end
+	return savedCFrame
+end
+
+local function getOtherGardens()
+	local gardens = Workspace:FindFirstChild("Gardens")
+	if not gardens then return {} end
+	local list = {}
+	for _, model in ipairs(gardens:GetChildren()) do
+		if model:GetAttribute("Owner") ~= player.Name then
+			table.insert(list, model)
+		end
+	end
+	return list
+end
+
+local function activateHarvestPrompts()
+	local garden = getMyGarden();
+	if not garden then return end
+	local plants = garden:FindFirstChild("Plants");  if not plants then return end
+
+	-- StreamingEnabled unloads distant plants/fruits; stream them in around the
+	-- garden WITHOUT moving the character (no-op if streaming is off).
+	pcall(function()
+		local pos = garden:GetPivot().Position
+		player:RequestStreamAroundAsync(pos)
+	end)
+
+	for _, plant in ipairs(plants:GetChildren()) do
+		if not (enabled and running) then break end
+		local plantId = plant:GetAttribute("PlantId")
+		local fruits  = plant:FindFirstChild("Fruits")
+		if plantId and fruits then
+			for _, fruit in ipairs(fruits:GetChildren()) do
+				local fruitId = fruit:GetAttribute("FruitId")
+				if fruitId then
+					pcall(function() Networking.Garden.CollectFruit:Fire(plantId, fruitId) end)
+				end
+			end
+		end
+		task.wait()
+	end
+end
+
+local function activateSeedPackPrompts()
+	local map = Workspace:FindFirstChild("Map");
+	if not map then return end
+	local spawns = map:FindFirstChild("SeedPackSpawnServerLocations");  if not spawns then return end
+	for _, obj in ipairs(spawns:GetDescendants()) do
+		if obj:IsA("ProximityPrompt") then firePrompt(obj) end
+	end
+end
+
+local function collectSeedPacks()
+	local map = Workspace:FindFirstChild("Map");
+	if not map then return end
+	local spawns = map:FindFirstChild("SeedPackSpawnServerLocations");  if not spawns then return end
+	local hrp = getHRP();
+	if not hrp then return end
+	for _, obj in ipairs(spawns:GetDescendants()) do
+		if obj:IsA("ProximityPrompt") and obj.Enabled then
+			local part = obj.Parent
+			if part and part:IsA("BasePart") then
+				local startCFrame = hrp.CFrame
+				hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+				task.wait(TP_SETTLE)
+				firePrompt(obj)
+				if RETURN_TO_START or STAY_IN_CENTER then
+					task.wait(TP_SETTLE)
+					hrp.CFrame = getReturnCFrame(startCFrame)
+				end
+			end
+		end
+	end
+end
+
+local function getFruitLabel()
+	local pg = player:FindFirstChild("PlayerGui");
+	if not pg then return nil end
+	local bg = pg:FindFirstChild("BackpackGui");        if not bg then return nil end
+	local bp = bg:FindFirstChild("Backpack");
+	if not bp then return nil end
+	local inv = bp:FindFirstChild("Inventory");
+	if not inv then return nil end
+	return inv:FindFirstChild("FruitInventory")
+end
+
+local function isInventoryFull()
+	local label = getFruitLabel()
+	if not label or not label:IsA("TextLabel") then return false end
+	local clean = label.Text:gsub("<[^>]->", ""):gsub(",", "")
+	local cur, max = string.match(clean, "(%d+)%s*/%s*(%d+)")
+	cur, max = tonumber(cur), tonumber(max)
+	return cur ~= nil and max ~= nil and cur >= max
+end
+
+local function stripVisuals()
+	local texClasses = { Decal = true, Texture = true, SurfaceAppearance = true }
+	local particleClasses = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
+	local removed, disabled, smoothed = 0, 0, 0
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if texClasses[obj.ClassName] then
+			pcall(function() obj:Destroy() end);
+			removed += 1
+		elseif particleClasses[obj.ClassName] then
+			pcall(function() obj.Enabled = false end); disabled += 1
+		elseif obj:IsA("BasePart") then
+			pcall(function()
+				obj.Material      = Enum.Material.SmoothPlastic
+				obj.TopSurface    = Enum.SurfaceType.Smooth
+				obj.BottomSurface = Enum.SurfaceType.Smooth
+				obj.LeftSurface   = Enum.SurfaceType.Smooth
+				obj.RightSurface  = Enum.SurfaceType.Smooth
+				obj.FrontSurface  = Enum.SurfaceType.Smooth
+				obj.BackSurface   = Enum.SurfaceType.Smooth
+				if obj:IsA("MeshPart") then obj.TextureID = "" end
+			end)
+			smoothed += 1
+		end
+	end
+	print(string.format("[AutoHarvest] Removed %d textures, disabled %d effects, smoothed %d parts.", removed, disabled, smoothed))
+end
+
+local hiddenParts = {}
+local function setOtherPlotsHidden(hide)
+	local gardens = Workspace:FindFirstChild("Gardens")
+	if not gardens then return end
+	if hide then
+		for _, model in ipairs(gardens:GetChildren()) do
+			if model:GetAttribute("Owner") ~= player.Name then
+				for _, obj in ipairs(model:GetDescendants()) do
+					if obj:IsA("BasePart") then
+						if hiddenParts[obj] == nil then hiddenParts[obj] = obj.Transparency end
+						pcall(function() obj.Transparency = 1 end)
+					end
+				end
+			end
+		end
+	else
+		for part, original in pairs(hiddenParts) do
+			if part and part.Parent then pcall(function() part.Transparency = original end) end
+		end
+		table.clear(hiddenParts)
+	end
+end
+
+--==================================================================
+-- AUTO STEAL LOGIC
+--==================================================================
+local function isOwnerInGarden(garden)
+	local ownerName = garden:GetAttribute("Owner")
+	if not ownerName then return false end
+	local ownerPlayer = Players:FindFirstChild(ownerName)
+	if not ownerPlayer or not ownerPlayer.Character then return false end
+	local ownerHRP = ownerPlayer.Character:FindFirstChild("HumanoidRootPart")
+	if not ownerHRP then return false end
+	local gardenPos = garden:GetPivot().Position
+	return (ownerHRP.Position - gardenPos).Magnitude < 120
+end
+
 local FruitValueCalc = nil
 pcall(function()
-    FruitValueCalc = require(ReplicatedStorage.SharedModules.FruitValueCalc)
+	FruitValueCalc = require(ReplicatedStorage.SharedModules.FruitValueCalc)
 end)
+
+local function getFruitValue(fruit)
+	if not FruitValueCalc then return 0 end
+	local fruitName = fruit:GetAttribute("FruitName")
+		or fruit:GetAttribute("Name")
+		or fruit.Name
+	if not fruitName then return 0 end
+	local ok, val = pcall(FruitValueCalc, fruitName,
+		fruit:GetAttribute("SizeMultiplier"),
+		fruit:GetAttribute("Mutation"),
+		player,
+		fruit:GetAttribute("DecayAlpha")
+	)
+	return (ok and type(val) == "number") and val or 0
+end
+
+local function collectStealTargets()
+	local targets = {}
+	for _, garden in ipairs(getOtherGardens()) do
+		local ownerName = garden:GetAttribute("Owner")
+		-- If highest value mode, ignore player filter and owner-present check happens per fruit
+		if not STEAL_HIGHEST_VALUE then
+			if not selectedStealTargets[ownerName] then continue end
+			if isOwnerInGarden(garden) then
+				print("[AutoSteal] Skipping " .. ownerName .. " - owner present.")
+				continue
+			end
+		end
+
+		local plants = garden:FindFirstChild("Plants")
+		if not plants then continue end
+
+		for _, plant in ipairs(plants:GetChildren()) do
+			local fruits = plant:FindFirstChild("Fruits")
+			if not fruits then continue end
+
+			for _, fruit in ipairs(fruits:GetChildren()) do
+				local harvestPart = fruit:FindFirstChild("HarvestPart")
+				if not harvestPart then continue end
+
+				local prompt
+				for _, desc in ipairs(harvestPart:GetDescendants()) do
+					if desc:IsA("ProximityPrompt") and desc:HasTag("StealPrompt") then
+						prompt = desc
+						break
+					end
+				end
+				if not prompt or not prompt.Enabled then continue end
+
+				local userId  = tonumber(fruit:GetAttribute("UserId"))
+					or tonumber(plant:GetAttribute("UserId"))
+					or tonumber(garden:GetAttribute("UserId"))
+				local plantId = fruit:GetAttribute("PlantId") or plant:GetAttribute("PlantId")
+				local fruitId = fruit:GetAttribute("FruitId")
+				if not userId or not plantId then continue end
+
+				table.insert(targets, {
+					garden     = garden,
+					ownerName  = ownerName,
+					fruit      = fruit,
+					harvestPart = harvestPart,
+					prompt     = prompt,
+					userId     = userId,
+					plantId    = plantId,
+					fruitId    = fruitId,
+					value      = getFruitValue(fruit),
+				})
+			end
+		end
+	end
+
+	if STEAL_HIGHEST_VALUE then
+		table.sort(targets, function(a, b) return a.value > b.value end)
+	end
+
+	return targets
+end
+
+-- Where stolen fruit gets banked. You confirmed PlotSizeReference is the spot,
+-- which is exactly what getGardenCenterCFrame already returns.
+local function getDepositCFrame()
+	return getGardenCenterCFrame()
+end
+
+local function doAutoSteal()
+	if stealing then return end
+
+	local nightVal = ReplicatedStorage:FindFirstChild("Night")
+	if not nightVal or nightVal.Value ~= true then
+		print("[AutoSteal] Not night time, skipping.")
+		return
+	end
+
+	stealing = true
+	local hrp = getHRP()
+	if not hrp then stealing = false return end
+
+	local targets = collectStealTargets()
+	print(string.format("[AutoSteal] Found %d stealable fruits.", #targets))
+	local stolen = 0
+
+	for _, t in ipairs(targets) do
+		if not (running and AUTO_STEAL) then break end
+
+		-- Skip if prompt is gone (already stolen by someone else)
+		if not t.prompt or not t.prompt.Enabled or not t.prompt:IsDescendantOf(Workspace) then
+			continue
+		end
+
+		-- In highest value mode, check owner presence per fruit
+		if STEAL_HIGHEST_VALUE and isOwnerInGarden(t.garden) then
+			print("[AutoSteal] Skipping fruit - owner " .. t.ownerName .. " is in their garden.")
+			continue
+		end
+
+		-- In target mode, re-check owner hasn't walked in
+		if not STEAL_HIGHEST_VALUE and isOwnerInGarden(t.garden) then
+			print("[AutoSteal] Owner " .. t.ownerName .. " entered garden, skipping remaining fruits.")
+			continue
+		end
+
+		hrp.CFrame = CFrame.new(t.harvestPart.Position + Vector3.new(0, 3, 0))
+		task.wait(TP_SETTLE)
+
+		-- Mirror a manual steal exactly: BeginSteal -> brief hold -> CompleteSteal.
+		-- The old code waited on a Steal.StealStarted client event that this game
+		-- never fires, then fired CancelSteal on timeout -- which cancelled every
+		-- single steal. A real manual steal only ever fires Begin then Complete.
+		pcall(function()
+			Networking.Steal.BeginSteal:Fire(t.userId, t.plantId, t.fruitId or "")
+		end)
+		task.wait(STEAL_HOLD_TIME)       -- let the server channel the steal
+		pcall(function() Networking.Steal.CompleteSteal:Fire() end)
+		task.wait(0.2)                   -- let the completion resolve before moving on
+
+		stolen += 1
+		if STEAL_AMOUNT > 0 and stolen >= STEAL_AMOUNT then
+			break                        -- deposit happens after the loop
+		end
+	end
+
+	local h = getHRP()
+	local depositCFrame = getDepositCFrame()
+	if h and depositCFrame then
+		h.CFrame = depositCFrame
+		task.wait(0.6)   -- stand in the deposit zone long enough to bank
+	end
+	if STEAL_AMOUNT > 0 then
+		print(string.format("[AutoSteal] Batch complete: stole %d fruit(s).", stolen))
+	end
+
+	stealing = false
+end
 
 --==================================================================
 -- CONFIG SYSTEM
 --==================================================================
-local CONFIG_FOLDER      = "AutoHarvestConfigs"
+local CONFIG_FOLDER = "AutoHarvestConfigs"
 local DEFAULT_CONFIG_NAME = "default"
 local AUTOLOAD_FILE_PATH = CONFIG_FOLDER .. "/autoload_target.txt"
 
@@ -108,67 +610,102 @@ local function getConfigPath(name)
 end
 
 local function ensureConfigFolder()
-    if not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end
+    if not isfolder(CONFIG_FOLDER) then
+        makefolder(CONFIG_FOLDER)
+    end
 end
 
 local function saveConfig(name)
     ensureConfigFolder()
     local config = {
-        enabled = enabled, AUTO_SELL = AUTO_SELL, AUTO_COLLECT = AUTO_COLLECT,
-        ANTI_AFK = ANTI_AFK, HIDE_OTHER_PLOTS = HIDE_OTHER_PLOTS,
-        AUTO_PETS = AUTO_PETS, TAME_TELEPORT = TAME_TELEPORT,
-        AUTO_STEAL = AUTO_STEAL, AUTO_SKIP_LOADING = AUTO_SKIP_LOADING,
-        autoBuySeeds = autoBuySeeds, autoBuyGear = autoBuyGear, autoBuyCrates = autoBuyCrates,
-        LOOP_INTERVAL = LOOP_INTERVAL, POLL_INTERVAL = POLL_INTERVAL,
-        COLLECT_INTERVAL = COLLECT_INTERVAL, TP_SETTLE = TP_SETTLE,
-        RETURN_TO_START = RETURN_TO_START, STAY_IN_CENTER = STAY_IN_CENTER,
-        STEAL_HIGHEST_VALUE = STEAL_HIGHEST_VALUE, STEAL_AMOUNT = STEAL_AMOUNT,
-        selectedSeeds = selectedSeeds, selectedGear = selectedGear,
-        selectedCrates = selectedCrates, selectedPetNames = selectedPetNames,
-        knownPetNames = knownPetNames, selectedStealTargets = selectedStealTargets,
+        enabled = enabled,
+        AUTO_SELL = AUTO_SELL,
+        AUTO_COLLECT = AUTO_COLLECT,
+        ANTI_AFK = ANTI_AFK,
+        HIDE_OTHER_PLOTS = HIDE_OTHER_PLOTS,
+        AUTO_PETS = AUTO_PETS,
+        TAME_TELEPORT = TAME_TELEPORT,
+        AUTO_STEAL = AUTO_STEAL,
+        AUTO_SKIP_LOADING = AUTO_SKIP_LOADING,
+        autoBuySeeds = autoBuySeeds,
+        autoBuyGear = autoBuyGear,
+        autoBuyCrates = autoBuyCrates,
+        LOOP_INTERVAL = LOOP_INTERVAL,
+        POLL_INTERVAL = POLL_INTERVAL,
+        COLLECT_INTERVAL = COLLECT_INTERVAL,
+        TP_SETTLE = TP_SETTLE,
+        RETURN_TO_START = RETURN_TO_START,
+        selectedSeeds = selectedSeeds,
+        selectedGear = selectedGear,
+        selectedCrates = selectedCrates,
+        selectedPetNames = selectedPetNames,
+        knownPetNames = knownPetNames,
+        selectedStealTargets = selectedStealTargets,
+		STEAL_HIGHEST_VALUE = STEAL_HIGHEST_VALUE,
+		STAY_IN_CENTER = STAY_IN_CENTER,
+        STEAL_AMOUNT = STEAL_AMOUNT,
     }
-    local ok, err = pcall(function()
+    local success, err = pcall(function()
         writefile(getConfigPath(name), HttpService:JSONEncode(config))
     end)
-    if ok then print("[Config] Saved '" .. name .. "'") return true
-    else warn("[Config] Save failed: " .. tostring(err)) return false end
+    if success then
+        print("[Config] Saved '" .. name .. "'")
+        return true
+    else
+        warn("[Config] Save failed: " .. tostring(err))
+        return false
+    end
 end
 
 local function loadConfig(name)
     local path = getConfigPath(name)
-    if not isfile(path) then warn("[Config] No config: '" .. name .. "'") return false end
-    local ok, result = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
-    if not ok or type(result) ~= "table" then warn("[Config] Load failed") return false end
-
-    if result.enabled            ~= nil then enabled            = result.enabled            end
-    if result.AUTO_SELL          ~= nil then AUTO_SELL          = result.AUTO_SELL          end
-    if result.AUTO_COLLECT       ~= nil then AUTO_COLLECT       = result.AUTO_COLLECT       end
-    if result.ANTI_AFK           ~= nil then ANTI_AFK           = result.ANTI_AFK           end
-    if result.HIDE_OTHER_PLOTS   ~= nil then HIDE_OTHER_PLOTS   = result.HIDE_OTHER_PLOTS   end
-    if result.AUTO_PETS          ~= nil then AUTO_PETS          = result.AUTO_PETS          end
-    if result.TAME_TELEPORT      ~= nil then TAME_TELEPORT      = result.TAME_TELEPORT      end
-    if result.AUTO_STEAL         ~= nil then AUTO_STEAL         = result.AUTO_STEAL         end
-    if result.AUTO_SKIP_LOADING  ~= nil then AUTO_SKIP_LOADING  = result.AUTO_SKIP_LOADING  end
-    if result.autoBuySeeds       ~= nil then autoBuySeeds       = result.autoBuySeeds       end
-    if result.autoBuyGear        ~= nil then autoBuyGear        = result.autoBuyGear        end
-    if result.autoBuyCrates      ~= nil then autoBuyCrates      = result.autoBuyCrates      end
-    if result.LOOP_INTERVAL      ~= nil then LOOP_INTERVAL      = result.LOOP_INTERVAL      end
-    if result.POLL_INTERVAL      ~= nil then POLL_INTERVAL      = result.POLL_INTERVAL      end
-    if result.COLLECT_INTERVAL   ~= nil then COLLECT_INTERVAL   = result.COLLECT_INTERVAL   end
-    if result.TP_SETTLE          ~= nil then TP_SETTLE          = result.TP_SETTLE          end
-    if result.RETURN_TO_START    ~= nil then RETURN_TO_START    = result.RETURN_TO_START    end
-    if result.STAY_IN_CENTER     ~= nil then STAY_IN_CENTER     = result.STAY_IN_CENTER     end
-    if result.STEAL_HIGHEST_VALUE~= nil then STEAL_HIGHEST_VALUE= result.STEAL_HIGHEST_VALUE end
-    if result.STEAL_AMOUNT       ~= nil then STEAL_AMOUNT       = result.STEAL_AMOUNT       end
-    if result.selectedSeeds      ~= nil then selectedSeeds      = result.selectedSeeds      end
-    if result.selectedGear       ~= nil then selectedGear       = result.selectedGear       end
-    if result.selectedCrates     ~= nil then selectedCrates     = result.selectedCrates     end
-    if result.selectedPetNames   ~= nil then selectedPetNames   = result.selectedPetNames   end
-    if result.selectedStealTargets ~= nil then selectedStealTargets = result.selectedStealTargets end
-    if type(result.knownPetNames) == "table" then
-        for k in pairs(result.knownPetNames) do knownPetNames[k] = true end
+    if not isfile(path) then
+        warn("[Config] No config found: '" .. name .. "'")
+        return false
     end
-    print("[Config] Loaded '" .. name .. "'") return true
+    local success, result = pcall(function()
+        return HttpService:JSONDecode(readfile(path))
+    end)
+    if not success or type(result) ~= "table" then
+        warn("[Config] Load failed: invalid file")
+        return false
+    end
+
+    if result.enabled ~= nil then enabled = result.enabled end
+    if result.AUTO_SELL ~= nil then AUTO_SELL = result.AUTO_SELL end
+    if result.AUTO_COLLECT ~= nil then AUTO_COLLECT = result.AUTO_COLLECT end
+    if result.ANTI_AFK ~= nil then ANTI_AFK = result.ANTI_AFK end
+    if result.HIDE_OTHER_PLOTS ~= nil then
+        HIDE_OTHER_PLOTS = result.HIDE_OTHER_PLOTS
+        setOtherPlotsHidden(HIDE_OTHER_PLOTS)
+    end
+    if result.AUTO_PETS ~= nil then AUTO_PETS = result.AUTO_PETS end
+    if result.TAME_TELEPORT ~= nil then TAME_TELEPORT = result.TAME_TELEPORT end
+    if result.AUTO_STEAL ~= nil then AUTO_STEAL = result.AUTO_STEAL end
+    if result.AUTO_SKIP_LOADING ~= nil then AUTO_SKIP_LOADING = result.AUTO_SKIP_LOADING end
+    if result.autoBuySeeds ~= nil then autoBuySeeds = result.autoBuySeeds end
+    if result.autoBuyGear ~= nil then autoBuyGear = result.autoBuyGear end
+    if result.autoBuyCrates ~= nil then autoBuyCrates = result.autoBuyCrates end
+    if result.LOOP_INTERVAL ~= nil then LOOP_INTERVAL = result.LOOP_INTERVAL end
+    if result.POLL_INTERVAL ~= nil then POLL_INTERVAL = result.POLL_INTERVAL end
+    if result.COLLECT_INTERVAL ~= nil then COLLECT_INTERVAL = result.COLLECT_INTERVAL end
+    if result.TP_SETTLE ~= nil then TP_SETTLE = result.TP_SETTLE end
+    if result.RETURN_TO_START ~= nil then RETURN_TO_START = result.RETURN_TO_START end
+    if result.selectedSeeds ~= nil then selectedSeeds = result.selectedSeeds end
+    if result.selectedGear ~= nil then selectedGear = result.selectedGear end
+    if result.selectedCrates ~= nil then selectedCrates = result.selectedCrates end
+    if result.selectedPetNames ~= nil then selectedPetNames = result.selectedPetNames end
+    -- Merge (never shrink) the known-pet roster across configs.
+    if type(result.knownPetNames) == "table" then
+        for petName in pairs(result.knownPetNames) do knownPetNames[petName] = true end
+    end
+    if result.selectedStealTargets ~= nil then selectedStealTargets = result.selectedStealTargets end
+	if result.STEAL_HIGHEST_VALUE ~= nil then STEAL_HIGHEST_VALUE = result.STEAL_HIGHEST_VALUE end
+	if result.STAY_IN_CENTER ~= nil then STAY_IN_CENTER = result.STAY_IN_CENTER end
+    if result.STEAL_AMOUNT ~= nil then STEAL_AMOUNT = result.STEAL_AMOUNT end
+
+    print("[Config] Loaded '" .. name .. "'")
+    return true
 end
 
 local function listConfigs()
@@ -177,1227 +714,1367 @@ local function listConfigs()
     local configs = {}
     for _, path in ipairs(files) do
         local name = path:match(CONFIG_FOLDER .. "/(.+)%.json$")
-        if name then table.insert(configs, name) end
+        if name then
+            table.insert(configs, name)
+        end
     end
     return configs
 end
 
 local function deleteConfig(name)
     local path = getConfigPath(name)
-    if isfile(path) then delfile(path) print("[Config] Deleted '" .. name .. "'") return true end
-    return false
-end
-
---==================================================================
--- CORE HELPERS
---==================================================================
-local function getHRP()
-    local char = character or player.Character
-    return char and char:FindFirstChild("HumanoidRootPart") or nil
-end
-
-local function getHumanoid()
-    local char = character or player.Character
-    return char and char:FindFirstChildWhichIsA("Humanoid") or nil
-end
-
-local function getMyGarden()
-    local gardens = Workspace:FindFirstChild("Gardens")
-    if not gardens then return nil end
-    for _, model in ipairs(gardens:GetChildren()) do
-        if model:GetAttribute("Owner") == player.Name then return model end
-    end
-    return nil
-end
-
-local function getGardenCenterCFrame()
-    local garden = getMyGarden()
-    if not garden then return nil end
-    local ref = garden:FindFirstChild("PlotSizeReference", true)
-    if ref and ref:IsA("BasePart") then
-        return CFrame.new(ref.Position + Vector3.new(0, 5, 0))
-    end
-    return CFrame.new(garden:GetPivot().Position + Vector3.new(0, 5, 0))
-end
-
--- Returns garden center if STAY_IN_CENTER and not taming, otherwise savedCFrame.
--- Key fix: taming overrides center so pets can actually be reached.
-local function getReturnCFrame(savedCFrame)
-    if STAY_IN_CENTER and not taming then
-        local center = getGardenCenterCFrame()
-        if center then return center end
-    end
-    return savedCFrame
-end
-
-local function getOtherGardens()
-    local gardens = Workspace:FindFirstChild("Gardens")
-    if not gardens then return {} end
-    local list = {}
-    for _, model in ipairs(gardens:GetChildren()) do
-        if model:GetAttribute("Owner") ~= player.Name then
-            table.insert(list, model)
-        end
-    end
-    return list
-end
-
-local function firePrompt(prompt)
-    if not prompt or not prompt:IsA("ProximityPrompt") then return end
-    if not prompt.Enabled then return end
-    if prompt.ActionText == "" and prompt.ObjectText == "" then return end
-    pcall(function()
-        prompt.MaxActivationDistance = math.huge
-        prompt.RequiresLineOfSight   = false
-        prompt.HoldDuration          = 0
-        prompt:InputHoldBegin()
-        prompt:InputHoldEnd()
-    end)
-end
-
---==================================================================
--- HARVEST / SEED PACKS
---==================================================================
-local function activateHarvestPrompts()
-    local garden = getMyGarden()
-    if not garden then return end
-    local plants = garden:FindFirstChild("Plants")
-    if not plants then return end
-    pcall(function()
-        player:RequestStreamAroundAsync(garden:GetPivot().Position)
-    end)
-    for _, plant in ipairs(plants:GetChildren()) do
-        if not (enabled and running) then break end
-        local plantId = plant:GetAttribute("PlantId")
-        local fruits  = plant:FindFirstChild("Fruits")
-        if plantId and fruits then
-            for _, fruit in ipairs(fruits:GetChildren()) do
-                local fruitId = fruit:GetAttribute("FruitId")
-                if fruitId then
-                    pcall(function() Networking.Garden.CollectFruit:Fire(plantId, fruitId) end)
-                end
-            end
-        end
-        task.wait()
-    end
-end
-
-local function activateSeedPackPrompts()
-    local map = Workspace:FindFirstChild("Map")
-    if not map then return end
-    local spawns = map:FindFirstChild("SeedPackSpawnServerLocations")
-    if not spawns then return end
-    for _, obj in ipairs(spawns:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") then firePrompt(obj) end
-    end
-end
-
-local function collectSeedPacks()
-    local map = Workspace:FindFirstChild("Map")
-    if not map then return end
-    local spawns = map:FindFirstChild("SeedPackSpawnServerLocations")
-    if not spawns then return end
-    local hrp = getHRP()
-    if not hrp then return end
-    for _, obj in ipairs(spawns:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") and obj.Enabled then
-            local part = obj.Parent
-            if part and part:IsA("BasePart") then
-                local startCFrame = hrp.CFrame
-                hrp.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
-                task.wait(TP_SETTLE)
-                firePrompt(obj)
-                task.wait(TP_SETTLE)
-                hrp.CFrame = getReturnCFrame(startCFrame)
-            end
-        end
-    end
-end
-
---==================================================================
--- INVENTORY
---==================================================================
-local function getFruitLabel()
-    local pg = player:FindFirstChild("PlayerGui")
-    if not pg then return nil end
-    local bg = pg:FindFirstChild("BackpackGui")
-    if not bg then return nil end
-    local bp = bg:FindFirstChild("Backpack")
-    if not bp then return nil end
-    local inv = bp:FindFirstChild("Inventory")
-    if not inv then return nil end
-    return inv:FindFirstChild("FruitInventory")
-end
-
-local function isInventoryFull()
-    local label = getFruitLabel()
-    if not label or not label:IsA("TextLabel") then return false end
-    local clean = label.Text:gsub("<[^>]->", ""):gsub(",", "")
-    local cur, max = string.match(clean, "(%d+)%s*/%s*(%d+)")
-    cur, max = tonumber(cur), tonumber(max)
-    return cur ~= nil and max ~= nil and cur >= max
-end
-
---==================================================================
--- VISUALS
---==================================================================
-local function stripVisuals()
-    local texClasses     = { Decal = true, Texture = true, SurfaceAppearance = true }
-    local particleClasses = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
-    local removed, disabled, smoothed = 0, 0, 0
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if texClasses[obj.ClassName] then
-            pcall(function() obj:Destroy() end); removed += 1
-        elseif particleClasses[obj.ClassName] then
-            pcall(function() obj.Enabled = false end); disabled += 1
-        elseif obj:IsA("BasePart") then
-            pcall(function()
-                obj.Material      = Enum.Material.SmoothPlastic
-                obj.TopSurface    = Enum.SurfaceType.Smooth
-                obj.BottomSurface = Enum.SurfaceType.Smooth
-                if obj:IsA("MeshPart") then obj.TextureID = "" end
-            end)
-            smoothed += 1
-        end
-    end
-    Rayfield:Notify({ Title = "Visuals Stripped", Content = string.format("Removed %d textures, disabled %d effects, smoothed %d parts.", removed, disabled, smoothed), Duration = 4 })
-end
-
-local hiddenParts = {}
-local function setOtherPlotsHidden(hide)
-    local gardens = Workspace:FindFirstChild("Gardens")
-    if not gardens then return end
-    if hide then
-        for _, model in ipairs(gardens:GetChildren()) do
-            if model:GetAttribute("Owner") ~= player.Name then
-                for _, obj in ipairs(model:GetDescendants()) do
-                    if obj:IsA("BasePart") then
-                        if hiddenParts[obj] == nil then hiddenParts[obj] = obj.Transparency end
-                        pcall(function() obj.Transparency = 1 end)
-                    end
-                end
-            end
-        end
-    else
-        for part, original in pairs(hiddenParts) do
-            if part and part.Parent then pcall(function() part.Transparency = original end) end
-        end
-        table.clear(hiddenParts)
-    end
-end
-
---==================================================================
--- AUTO PETS
---==================================================================
-local tameCooldown = setmetatable({}, { __mode = "k" })
-local TAME_RETRY   = 5
-local TAME_HOLD    = 0.8
-
-local function findWildPetsFolder()
-    local map = Workspace:FindFirstChild("Map")
-    if not map then return nil end
-    return map:FindFirstChild("WildPetSpawns")
-        or map:FindFirstChild("WildPets")
-        or map:FindFirstChild("WildPetSpawn")
-        or Workspace:FindFirstChild("WildPetSpawns")
-        or nil
-end
-
-local function findWildPetRefFolder()
-    local map = Workspace:FindFirstChild("Map")
-    return map and map:FindFirstChild("WildPetRef") or nil
-end
-
-local function petInfo(model)
-    local name = model:GetAttribute("PetName")
-        or model.Name:match("^WildPet_(.-)_WildPet_")
-        or model.Name:match("^WildPet_(.+)$")
-        or model.Name
-    local id = model.Name:match("WildPet_.-_WildPet_(.+)")
-    return name, id
-end
-
-local function petMatchesFilters(model)
-    local name = petInfo(model)
-    if next(selectedPetNames) == nil then return true end
-    return selectedPetNames[name] == true
-end
-
-local function isPetTamed(model)
-    if not model then return false end
-    if not model:IsDescendantOf(Workspace) then return true end
-    if model:GetAttribute("Tamed") == true then return true end
-    if model:GetAttribute("Claimed") == true then return true end
-    local owner = model:GetAttribute("Owner") or model:GetAttribute("TamedBy") or model:GetAttribute("OwnerName")
-    if owner ~= nil and owner ~= "" then return true end
-    return false
-end
-
-local function getPetRefPart(model)
-    local refFolder = findWildPetRefFolder()
-    if not refFolder then return nil end
-    local _, id = petInfo(model)
-    if id then
-        local exact = refFolder:FindFirstChild("WildPet_" .. id)
-        if exact then return exact end
-        for _, p in ipairs(refFolder:GetChildren()) do
-            if p.Name:find(id, 1, true) then return p end
-        end
-    end
-    local modelPart = model:FindFirstChild("RootPart") or model:FindFirstChildWhichIsA("BasePart", true)
-    if modelPart then
-        local best, bestDist
-        for _, p in ipairs(refFolder:GetChildren()) do
-            if p:IsA("BasePart") then
-                local d = (p.Position - modelPart.Position).Magnitude
-                if not bestDist or d < bestDist then best, bestDist = p, d end
-            end
-        end
-        if best and bestDist and bestDist < 30 then return best end
-    end
-    return nil
-end
-
--- Tame a single pet ref part.
--- STAY_IN_CENTER is intentionally ignored while taming so the center loop
--- never teleports us back before we reach the pet.
-local function fireTameAt(part, model)
-    if not (part and part:IsDescendantOf(Workspace)) then return false end
-    if model and isPetTamed(model) then return false end
-
-    local now = os.clock()
-    if (now - (tameCooldown[part] or -math.huge)) < TAME_RETRY then return false end
-    tameCooldown[part] = now
-
-    local hrp = getHRP()
-    if not hrp then return false end
-
-    taming = true  -- blocks center-return loop
-
-    local pos    = part:IsA("BasePart") and part.Position or part:GetPivot().Position
-    local origin = hrp.CFrame
-
-    if TAME_TELEPORT then
-        -- Teleport directly onto the pet, fire multiple times, hold, THEN return.
-        hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
-        task.wait(TP_SETTLE)
-
-        for i = 1, 6 do
-            if model and isPetTamed(model) then break end
-            pcall(function() Networking.Pets.WildPetTame:Fire(part) end)
-            task.wait(0.15)
-        end
-        task.wait(TAME_HOLD)
-
-        -- Only now return — and only if pet is tamed or we've given up
-        hrp = getHRP()
-        if hrp then
-            -- When taming is done, respect STAY_IN_CENTER by going to center,
-            -- otherwise go back to origin.
-            if STAY_IN_CENTER then
-                local center = getGardenCenterCFrame()
-                if center then hrp.CFrame = center end
-            else
-                hrp.CFrame = origin
-            end
-        end
-    else
-        -- Walk path
-        local hum = getHumanoid()
-        local originalSpeed = hum and hum.WalkSpeed or 16
-        if hum then hum.WalkSpeed = 60 end
-
-        local arrived = false
-        local conn = hum and hum.MoveToFinished:Connect(function(r) arrived = r end)
-        if hum then hum:MoveTo(pos) end
-
-        local waited = 0
-        while not arrived and waited < 6 do
-            if hum then hum:MoveTo(pos) end
-            task.wait(0.1); waited += 0.1
-            if (hrp.Position - pos).Magnitude < 8 then arrived = true end
-            if model and isPetTamed(model) then break end
-        end
-        if conn then conn:Disconnect() end
-
-        if arrived then
-            for _ = 1, 5 do
-                if model and isPetTamed(model) then break end
-                pcall(function() Networking.Pets.WildPetTame:Fire(part) end)
-                task.wait(0.12)
-            end
-            task.wait(TAME_HOLD)
-        end
-        if hum then hum.WalkSpeed = originalSpeed end
-    end
-
-    taming = false
-    return true
-end
-
-local function autoTamePets()
-    if taming then return end
-    local spawnFolder = findWildPetsFolder()
-    if spawnFolder then
-        for _, model in ipairs(spawnFolder:GetChildren()) do
-            if not (running and AUTO_PETS) then break end
-            if (model:IsA("Model") or model:IsA("Folder")) and petMatchesFilters(model) and not isPetTamed(model) then
-                fireTameAt(getPetRefPart(model), model)
-                task.wait(0.1)
-            end
-        end
-        return
-    end
-    -- fallback: ref folder directly
-    local refFolder = findWildPetRefFolder()
-    if refFolder then
-        for _, part in ipairs(refFolder:GetChildren()) do
-            if not (running and AUTO_PETS) then break end
-            fireTameAt(part, nil)
-            task.wait(0.1)
-        end
-    end
-end
-
-local function testTameFirstPet()
-    local folder = findWildPetsFolder()
-    if not folder then
-        Rayfield:Notify({ Title = "Pets", Content = "No wild pet folder found. Check output.", Duration = 4 })
-        warn("[Pets] No wild pet folder found")
-        return
-    end
-    for _, model in ipairs(folder:GetChildren()) do
-        if (model:IsA("Model") or model:IsA("Folder")) and petMatchesFilters(model) then
-            local name = petInfo(model)
-            local refPart = getPetRefPart(model)
-            if not refPart then
-                Rayfield:Notify({ Title = "Pets", Content = "No WildPetRef part for " .. model.Name, Duration = 4 })
-                return
-            end
-            Rayfield:Notify({ Title = "Pets", Content = "Taming: " .. tostring(name), Duration = 3 })
-            tameCooldown[refPart] = nil
-            task.spawn(function() fireTameAt(refPart, model) end)
-            return
-        end
-    end
-    Rayfield:Notify({ Title = "Pets", Content = "No matching wild pets found.", Duration = 3 })
-end
-
-local function addKnownPet(name)
-    if type(name) == "string" and name ~= "" and not knownPetNames[name] then
-        knownPetNames[name] = true; return true
+    if isfile(path) then
+        delfile(path)
+        print("[Config] Deleted '" .. name .. "'")
+        return true
     end
     return false
-end
-
-local function refreshKnownPetsFromAssets()
-    local assets = ReplicatedStorage:FindFirstChild("Assets")
-    local folder = assets and assets:FindFirstChild("Pets")
-    if not folder then return end
-    for _, child in ipairs(folder:GetChildren()) do addKnownPet(child.Name) end
-end
-
-local function refreshKnownPetsFromWorld()
-    local folder = findWildPetsFolder()
-    if folder then
-        for _, m in ipairs(folder:GetChildren()) do
-            if m:IsA("Model") or m:IsA("Folder") then addKnownPet((petInfo(m))) end
-        end
-    end
-    for name in pairs(selectedPetNames) do addKnownPet(name) end
-end
-
-local function debugWildPets()
-    local folder = findWildPetsFolder()
-    if not folder then
-        warn("[Pets] No wild pet folder. Map children:")
-        local map = Workspace:FindFirstChild("Map")
-        if map then for _, c in ipairs(map:GetChildren()) do print("  Map >", c.Name, c.ClassName) end end
-        return
-    end
-    print("[Pets] Folder:", folder:GetFullName())
-    for i, m in ipairs(folder:GetChildren()) do
-        if i > 8 then print("  ... (truncated)"); break end
-        local name, id = petInfo(m)
-        local ref = getPetRefPart(m)
-        print(string.format("  [%d] %s | name=%s | id=%s | ref=%s | tamed=%s",
-            i, m.Name, tostring(name), tostring(id),
-            ref and ref:GetFullName() or "NONE",
-            tostring(isPetTamed(m))
-        ))
-    end
-end
-
---==================================================================
--- AUTO STEAL
---==================================================================
-local function isOwnerInGarden(garden)
-    local ownerName = garden:GetAttribute("Owner")
-    if not ownerName then return false end
-    local ownerPlayer = Players:FindFirstChild(ownerName)
-    if not ownerPlayer or not ownerPlayer.Character then return false end
-    local ownerHRP = ownerPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if not ownerHRP then return false end
-    return (ownerHRP.Position - garden:GetPivot().Position).Magnitude < 120
-end
-
-local function getFruitValue(fruit)
-    if not FruitValueCalc then return 0 end
-    local fruitName = fruit:GetAttribute("FruitName") or fruit:GetAttribute("Name") or fruit.Name
-    if not fruitName then return 0 end
-    local ok, val = pcall(FruitValueCalc, fruitName,
-        fruit:GetAttribute("SizeMultiplier"),
-        fruit:GetAttribute("Mutation"),
-        player,
-        fruit:GetAttribute("DecayAlpha")
-    )
-    return (ok and type(val) == "number") and val or 0
-end
-
-local function collectStealTargets()
-    local targets = {}
-    for _, garden in ipairs(getOtherGardens()) do
-        local ownerName = garden:GetAttribute("Owner")
-        if not STEAL_HIGHEST_VALUE then
-            if not selectedStealTargets[ownerName] then continue end
-            if isOwnerInGarden(garden) then continue end
-        end
-        local plants = garden:FindFirstChild("Plants")
-        if not plants then continue end
-        pcall(function() player:RequestStreamAroundAsync(garden:GetPivot().Position) end)
-
-        for _, plant in ipairs(plants:GetChildren()) do
-            local fruits = plant:FindFirstChild("Fruits")
-            if not fruits then continue end
-            for _, fruit in ipairs(fruits:GetChildren()) do
-                local harvestPart = fruit:FindFirstChild("HarvestPart")
-                if not harvestPart then continue end
-
-                -- Find StealPrompt
-                local prompt
-                for _, desc in ipairs(harvestPart:GetDescendants()) do
-                    if desc:IsA("ProximityPrompt") and desc:HasTag("StealPrompt") then
-                        prompt = desc; break
-                    end
-                end
-                if not prompt or not prompt.Enabled then continue end
-
-                -- Get IDs -- check fruit, then plant, then garden attributes
-                local userId = tonumber(fruit:GetAttribute("UserId"))
-                    or tonumber(plant:GetAttribute("UserId"))
-                    or tonumber(garden:GetAttribute("UserId"))
-                -- Fallback: look up by owner name
-                if not userId then
-                    local op = Players:FindFirstChild(ownerName)
-                    if op then userId = op.UserId end
-                end
-
-                local plantId = fruit:GetAttribute("PlantId") or plant:GetAttribute("PlantId")
-                local fruitId = fruit:GetAttribute("FruitId")
-                if not userId or not plantId then continue end
-
-                table.insert(targets, {
-                    garden      = garden,
-                    ownerName   = ownerName,
-                    fruit       = fruit,
-                    harvestPart = harvestPart,
-                    prompt      = prompt,
-                    userId      = userId,
-                    plantId     = plantId,
-                    fruitId     = fruitId,
-                    value       = getFruitValue(fruit),
-                })
-            end
-        end
-    end
-    if STEAL_HIGHEST_VALUE then
-        table.sort(targets, function(a, b) return a.value > b.value end)
-    end
-    return targets
-end
-
-local function doAutoSteal()
-    if stealing then return end
-    local nightVal = ReplicatedStorage:FindFirstChild("Night")
-    if not nightVal or nightVal.Value ~= true then return end
-
-    stealing = true
-    local hrp = getHRP()
-    if not hrp then stealing = false return end
-
-    local targets = collectStealTargets()
-    if #targets == 0 then stealing = false return end
-    print(string.format("[AutoSteal] %d stealable fruits found.", #targets))
-
-    local stolen = 0
-    for _, t in ipairs(targets) do
-        if not (running and AUTO_STEAL) then break end
-
-        -- Re-validate prompt still exists and is enabled
-        if not t.prompt or not t.prompt.Enabled then continue end
-        if not pcall(function() return t.prompt:IsDescendantOf(Workspace) end) then continue end
-        if not t.prompt:IsDescendantOf(Workspace) then continue end
-
-        -- Owner check per-fruit
-        if isOwnerInGarden(t.garden) then
-            print("[AutoSteal] Owner in garden, skipping: " .. t.ownerName)
-            continue
-        end
-
-        -- Teleport to the fruit (server is distance-gated)
-        hrp = getHRP()
-        if not hrp then break end
-        hrp.CFrame = CFrame.new(t.harvestPart.Position + Vector3.new(0, 3, 0))
-        task.wait(TP_SETTLE)
-
-        -- Fire exactly as the game does for instant-trigger prompts
-        pcall(function() Networking.Steal.BeginSteal:Fire(t.userId, t.plantId, t.fruitId or "") end)
-        task.wait(STEAL_HOLD_TIME)
-        pcall(function() Networking.Steal.CompleteSteal:Fire() end)
-        task.wait(0.2)
-
-        stolen += 1
-        if STEAL_AMOUNT > 0 and stolen >= STEAL_AMOUNT then break end
-    end
-
-    -- Return to garden center after steal run
-    hrp = getHRP()
-    if hrp then
-        local center = getGardenCenterCFrame()
-        if center then
-            hrp.CFrame = center
-            task.wait(0.8)
-        end
-    end
-
-    print(string.format("[AutoSteal] Done. Stole %d fruit(s).", stolen))
-    stealing = false
 end
 
 --==================================================================
 -- AUTO SHOP
 --==================================================================
 local function parseStock(itemFrame)
-    local main = itemFrame:FindFirstChild("Main_Frame")
-    if not main then return nil end
-    local stockLabel = main:FindFirstChild("Stock_Text")
-    if not stockLabel then return nil end
-    return tonumber(string.match(stockLabel.Text, "x(%d+)")) or 0
+	local main = itemFrame:FindFirstChild("Main_Frame")
+	if not main then return nil end
+	local stockLabel = main:FindFirstChild("Stock_Text")
+	if not stockLabel then return nil end
+	local n = string.match(stockLabel.Text, "x(%d+)")
+	return tonumber(n) or 0
 end
 
 local function readShopStock(scrollFrame)
-    local list = {}
-    if not scrollFrame then return list end
-    for _, frame in ipairs(scrollFrame:GetChildren()) do
-        if frame:IsA("Frame") and frame:FindFirstChild("Main_Frame") then
-            local stock = parseStock(frame)
-            if stock and stock > 0 then
-                table.insert(list, { name = frame.Name, stock = stock })
-            end
-        end
-    end
-    return list
+	local list = {}
+	if not scrollFrame then return list end
+	for _, frame in ipairs(scrollFrame:GetChildren()) do
+		if frame:IsA("Frame") and frame:FindFirstChild("Main_Frame") then
+			local stock = parseStock(frame)
+			if stock and stock > 0 then
+				table.insert(list, { name = frame.Name, stock = stock })
+			end
+		end
+	end
+	return list
 end
 
 local function getSeedShopFrame()
-    local gui = player.PlayerGui:FindFirstChild("SeedShop")
-    if not gui then return nil end
-    local frame = gui:FindFirstChild("Frame")
-    return frame and frame:FindFirstChild("NormalShop") or nil
+	local gui = player.PlayerGui:FindFirstChild("SeedShop")
+	if not gui then return nil end
+	local frame = gui:FindFirstChild("Frame")
+	return frame and frame:FindFirstChild("NormalShop") or nil
 end
 local function getGearShopFrame()
-    local gui = player.PlayerGui:FindFirstChild("GearShop")
-    if not gui then return nil end
-    local frame = gui:FindFirstChild("Frame")
-    return frame and (frame:FindFirstChild("NormalShop") or frame:FindFirstChild("Shop")) or nil
+	local gui = player.PlayerGui:FindFirstChild("GearShop")
+	if not gui then return nil end
+	local frame = gui:FindFirstChild("Frame")
+	return frame and (frame:FindFirstChild("NormalShop") or frame:FindFirstChild("Shop")) or nil
 end
 local function getCrateShopFrame()
-    local gui = player.PlayerGui:FindFirstChild("CrateShop")
-    if not gui then return nil end
-    local frame = gui:FindFirstChild("Frame")
-    return frame and (frame:FindFirstChild("NormalShop") or frame:FindFirstChild("Shop")) or nil
+	local gui = player.PlayerGui:FindFirstChild("CrateShop")
+	if not gui then return nil end
+	local frame = gui:FindFirstChild("Frame")
+	return frame and (frame:FindFirstChild("NormalShop") or frame:FindFirstChild("Shop")) or nil
+end
+
+local function buyItem(remote, name, count)
+	for _ = 1, count do
+		if not running then break end
+		pcall(function() remote:Fire(name) end)
+		task.wait(0.08)
+	end
 end
 
 local function buyShop(getFrame, remote, filter)
-    for _, item in ipairs(readShopStock(getFrame())) do
-        if not running then break end
-        if filter == nil or filter[item.name] then
-            for _ = 1, item.stock do
-                if not running then break end
-                pcall(function() remote:Fire(item.name) end)
-                task.wait(0.08)
-            end
-        end
-    end
+	for _, item in ipairs(readShopStock(getFrame())) do
+		if filter == nil or filter[item.name] then
+			buyItem(remote, item.name, item.stock)
+		end
+	end
 end
 
-local function buyAllSeeds()  buyShop(getSeedShopFrame,  Networking.SeedShop.PurchaseSeed,   nil) end
-local function buyAllGear()   buyShop(getGearShopFrame,  Networking.GearShop.PurchaseGear,   nil) end
-local function buyAllCrates() buyShop(getCrateShopFrame, Networking.CrateShop.PurchaseCrate, nil) end
+local function buyAllSeeds()  buyShop(getSeedShopFrame,  Networking.SeedShop.PurchaseSeed,  nil); print("[Shop] seeds done")  end
+local function buyAllGear()   buyShop(getGearShopFrame,  Networking.GearShop.PurchaseGear,  nil); print("[Shop] gear done")   end
+local function buyAllCrates() buyShop(getCrateShopFrame, Networking.CrateShop.PurchaseCrate, nil); print("[Shop] crates done") end
 
 --==================================================================
--- CAPTURE TOOL
+-- AUTO PETS (wild pet tame)
 --==================================================================
+local function findWildPetsFolder()
+	local map = Workspace:FindFirstChild("Map")
+	if not map then return nil end
+	return map:FindFirstChild("WildPetSpawns")
+		or map:FindFirstChild("WildPets")
+		or map:FindFirstChild("WildPetSpawn")
+		or Workspace:FindFirstChild("WildPetSpawns")
+		or nil
+end
+
+local function debugWildPets()
+	local folder = findWildPetsFolder()
+	if not folder then
+		warn("[Pets] No wild pet folder found. Children of Map:")
+		local map = Workspace:FindFirstChild("Map")
+		if map then
+			for _, c in ipairs(map:GetChildren()) do
+				print("   Map > " .. c.Name .. "  (" .. c.ClassName .. ")")
+			end
+		else
+			warn("   Workspace.Map itself is missing.")
+		end
+		return
+	end
+	print("[Pets] Found folder: " .. folder:GetFullName())
+	local kids = folder:GetChildren()
+	print("[Pets] " .. #kids .. " children.")
+	for i, m in ipairs(kids) do
+		if i > 5 then print("   ... (truncated)"); break end
+		print(string.format("   [%d] %s (%s)", i, m.Name, m.ClassName))
+		local prompt = m:FindFirstChildWhichIsA("ProximityPrompt", true)
+		print("        prompt: " .. (prompt and prompt:GetFullName() or "NONE FOUND"))
+	end
+end
+
+-- Hardened parse: handles single-word names AND multi-token names that may
+-- carry underscores (e.g. WildPet_Golden_Dragonfly_WildPet_xxxx -> "Golden_Dragonfly").
+local function petInfo(model)
+	local name = model:GetAttribute("PetName")
+		or model.Name:match("^WildPet_(.-)_WildPet_")
+		or model.Name:match("^WildPet_(.+)$")
+		or model.Name
+	local id = model.Name:match("WildPet_.-_WildPet_(.+)")
+	return name, id
+end
+
+local function petMatchesFilters(model)
+	local name = petInfo(model)
+	if next(selectedPetNames) == nil then return true end
+	return selectedPetNames[name] == true
+end
+
+--------------------------------------------------------------------
+-- MASTER PET ROSTER (select pets whether or not they're spawned,
+-- just like selecting seeds whether or not they're in stock)
+--------------------------------------------------------------------
+local function addKnownPet(name)
+	if type(name) == "string" and name ~= "" and not knownPetNames[name] then
+		knownPetNames[name] = true
+		return true
+	end
+	return false
+end
+
+local function findPetAssetsFolder()
+	local assets = ReplicatedStorage:FindFirstChild("Assets")
+	return assets and assets:FindFirstChild("Pets") or nil
+end
+
+-- Canonical roster, straight from Assets.Pets (plain model names = pet names),
+-- the pet-tab equivalent of reading the seed shop frame.
+local function refreshKnownPetsFromAssets()
+	local folder = findPetAssetsFolder()
+	if not folder then return 0 end
+	local added = 0
+	for _, child in ipairs(folder:GetChildren()) do
+		if addKnownPet(child.Name) then added += 1 end
+	end
+	return added
+end
+
+-- Names from spawned pets are guaranteed to match the filter, since they come
+-- from the same petInfo() the tamer compares against. Picks up any oddball not
+-- listed in Assets.Pets.
+local function refreshKnownPetsFromWorld()
+	local folder = findWildPetsFolder()
+	if folder then
+		for _, m in ipairs(folder:GetChildren()) do
+			if m:IsA("Model") or m:IsA("Folder") then
+				addKnownPet((petInfo(m)))
+			end
+		end
+	end
+	for name in pairs(selectedPetNames) do addKnownPet(name) end -- keep loaded selections visible
+end
+
+-- Best-effort "is this wild pet already tamed / gone" check so we don't
+-- teleport to a pet that no longer needs taming. A tamed pet is usually removed
+-- from the spawn folder; the attribute checks catch cases where it lingers.
+local function isPetTamed(model)
+	if not model then return false end                          -- ref-only path, can't tell -> attempt
+	if not model:IsDescendantOf(Workspace) then return true end -- removed = tamed/despawned
+	if model:GetAttribute("Tamed") == true then return true end
+	if model:GetAttribute("Claimed") == true then return true end
+	local owner = model:GetAttribute("Owner")
+		or model:GetAttribute("TamedBy")
+		or model:GetAttribute("OwnerName")
+	if owner ~= nil and owner ~= "" then return true end
+	if model:FindFirstChild("Owner") or model:FindFirstChild("Tamed") then return true end
+	return false
+end
+
+local function findWildPetRefFolder()
+	local map = Workspace:FindFirstChild("Map")
+	return map and map:FindFirstChild("WildPetRef") or nil
+end
+
+-- Resolve a spawn model (which carries the pet type for filtering) to the ref
+-- part in Workspace.Map.WildPetRef that WildPetTame actually wants.
+local function getPetRefPart(model)
+	local refFolder = findWildPetRefFolder()
+	if not refFolder then return nil end
+
+	local _, id = petInfo(model)
+	if id then
+		local exact = refFolder:FindFirstChild("WildPet_" .. id)
+		if exact then return exact end
+		for _, p in ipairs(refFolder:GetChildren()) do
+			if p.Name:find(id, 1, true) then return p end
+		end
+	end
+
+	local modelPart = model:FindFirstChild("RootPart") or model:FindFirstChildWhichIsA("BasePart", true)
+	if modelPart then
+		local best, bestDist
+		for _, p in ipairs(refFolder:GetChildren()) do
+			if p:IsA("BasePart") then
+				local d = (p.Position - modelPart.Position).Magnitude
+				if not bestDist or d < bestDist then best, bestDist = p, d end
+			end
+		end
+		if best and bestDist and bestDist < 30 then return best end
+	end
+	return nil
+end
+
+local function enterTame()
+	tameDepth += 1
+	petTaming = true
+end
+local function exitTame()
+	tameDepth = math.max(0, tameDepth - 1)
+	if tameDepth == 0 then petTaming = false end
+end
+
+-- Per-part cooldown: don't keep teleporting to a pet that won't tame (e.g. full
+-- pet slots). Weak keys so tamed/removed parts clear themselves.
+local tameCooldown = setmetatable({}, { __mode = "k" })
+local TAME_RETRY   = 5
+
+-- Fire WildPetTame on a ref part. WildPetTame is distance-checked server-side,
+-- so if TAME_TELEPORT is on we hop to the pet, fire, HOLD, then hop back.
+local TAME_WALKSPEED = 60    -- lower = less likely to ram parts; raise if too slow
+local TAME_HOLD      = 0.6   -- seconds parked ON the pet after firing, before returning
+
+local function fireTameAt(part, model)
+	if not (part and (part:IsA("BasePart") or part:IsA("Model"))) then return false end
+	if model and isPetTamed(model) then return false end         -- already tamed -> don't bother
+	if not part:IsDescendantOf(Workspace) then return false end  -- ref part gone -> skip
+
+	local now = os.clock()
+	if (now - (tameCooldown[part] or -math.huge)) < TAME_RETRY then return false end
+	tameCooldown[part] = now
+
+	local char = character or player.Character
+	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+	local hum  = char and char:FindFirstChildWhichIsA("Humanoid")
+	if not hrp then return false end
+
+	taming = true
+	enterTame()
+
+	local pos    = part:IsA("BasePart") and part.Position or part:GetPivot().Position
+	local origin = hrp.CFrame
+
+	if TAME_TELEPORT then
+		-- Teleport directly ON the pet so we ALWAYS reach it, fire repeatedly
+		-- while parked, HOLD long enough for the server to register, THEN return.
+		-- (This is what fixes the "teleports back before reaching" failures.)
+		hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+		task.wait(TP_SETTLE)
+
+		for _ = 1, 5 do
+			if model and isPetTamed(model) then break end -- stop firing the instant it tames
+			pcall(function() Networking.Pets.WildPetTame:Fire(part) end)
+			task.wait(0.12)
+		end
+
+		task.wait(TAME_HOLD)                               -- DO NOT return early
+		local h = getHRP()
+		if h then h.CFrame = getReturnCFrame(origin) end
+	else
+		-- Walk path: disable collisions, move to the pet, and only fire AFTER we
+		-- have actually arrived. If we never get close, skip rather than fire blind.
+		local originalSpeed = hum and hum.WalkSpeed or 16
+		local restoreCollide = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("BasePart") and d.CanCollide then
+				restoreCollide[d] = true
+				d.CanCollide = false
+			end
+		end
+		if hum then hum.WalkSpeed = TAME_WALKSPEED end
+
+		local arrived = false
+		local conn = hum and hum.MoveToFinished:Connect(function(reached) arrived = reached end)
+		if hum then hum:MoveTo(pos) end
+
+		local waited = 0
+		while not arrived and waited < 5 do
+			if hum then hum:MoveTo(pos) end
+			task.wait(0.1)
+			waited += 0.1
+			if (hrp.Position - pos).Magnitude < 8 then arrived = true end
+			if model and isPetTamed(model) then break end
+		end
+		if conn then conn:Disconnect() end
+
+		if arrived and (hrp.Position - pos).Magnitude < 12 then
+			for _ = 1, 4 do
+				if model and isPetTamed(model) then break end
+				pcall(function() Networking.Pets.WildPetTame:Fire(part) end)
+				task.wait(0.1)
+			end
+			task.wait(TAME_HOLD)
+		end
+
+		for d in pairs(restoreCollide) do
+			if d and d.Parent then d.CanCollide = true end
+		end
+		if hum then hum.WalkSpeed = originalSpeed end
+	end
+
+	taming = false
+	exitTame()
+	return true
+end
+
+local function tameWildPet(model)
+	if isPetTamed(model) then return end
+	fireTameAt(getPetRefPart(model), model)
+end
+
+local function autoTamePets()
+	enterTame()
+
+	-- Primary path: iterate spawned pet MODELS so we can read tamed-state and
+	-- skip pets that are already tamed (fixes "still goes for an already-tamed pet").
+	local spawnFolder = findWildPetsFolder()
+	if spawnFolder then
+		for _, model in ipairs(spawnFolder:GetChildren()) do
+			if not (running and AUTO_PETS) then break end
+			if (model:IsA("Model") or model:IsA("Folder")) then
+				if petMatchesFilters(model) and not isPetTamed(model) then
+					fireTameAt(getPetRefPart(model), model)
+				end
+			end
+		end
+		exitTame()
+		return
+	end
+
+	-- Fallback: no spawn folder available -> tame via ref parts directly
+	-- (no per-pet tamed info here, but the cooldown still prevents spam).
+	local refFolder = findWildPetRefFolder()
+	if refFolder then
+		for _, part in ipairs(refFolder:GetChildren()) do
+			if not (running and AUTO_PETS) then break end
+			fireTameAt(part, nil)
+		end
+	end
+	exitTame()
+end
+
+local function testTameFirstPet()
+	local folder = findWildPetsFolder()
+	if not folder then warn("[Pets] No wild pet folder found.") return end
+	for _, model in ipairs(folder:GetChildren()) do
+		if (model:IsA("Model") or model:IsA("Folder")) and petMatchesFilters(model) then
+			local name = petInfo(model)
+			local refPart = getPetRefPart(model)
+			if not refPart then
+				warn("[Pets] Couldn't find a WildPetRef part for " .. model.Name)
+				return
+			end
+			print("[Pets] Taming " .. tostring(name) .. " via " .. refPart:GetFullName()
+				.. (TAME_TELEPORT and "  (teleport ON)" or "  (teleport OFF)"))
+			tameCooldown[refPart] = nil -- allow an immediate manual test
+			task.spawn(function() fireTameAt(refPart, model) end)
+			return
+		end
+	end
+	warn("[Pets] No matching wild pets to test on.")
+end
+
 local captureInstalled = false
 local CAPTURE_DENYLIST = {
-    ["Garden.CollectFruit"] = true, ["SeedShop.PurchaseSeed"] = true,
-    ["GearShop.PurchaseGear"] = true, ["CrateShop.PurchaseCrate"] = true,
-    ["NPCS.SellAll"] = true,
+	["Garden.CollectFruit"] = true,
+	["SeedShop.PurchaseSeed"] = true,
+	["GearShop.PurchaseGear"] = true,
+	["CrateShop.PurchaseCrate"] = true,
+	["NPCS.SellAll"] = true,
+	["ObjectPositionService.CreateServerValue"] = true,
+    ["Steal.BeginSteal"] = true,
 }
 
+local function describeArg(i, v)
+	local t = typeof(v)
+	if t == "Instance" then
+		return string.format("[%d] Instance(%s) = %s", i, v.ClassName, v:GetFullName())
+	elseif t == "table" then
+		local ok, encoded = pcall(function() return HttpService:JSONEncode(v) end)
+		return string.format("[%d] table = %s", i, ok and encoded or "<unencodable table>")
+	else
+		return string.format("[%d] %s = %s", i, t, tostring(v))
+	end
+end
+
+local captureLastPrint = {}
+local captureKeywords = nil
+local function labelMatchesFilter(label)
+	if not captureKeywords then return true end
+	local low = label:lower()
+	for _, kw in ipairs(captureKeywords) do
+		if low:find(kw, 1, true) then return true end
+	end
+	return false
+end
+
+local function wrapRemoteFire(label, remote)
+	local orig = remote.Fire
+	if type(orig) ~= "function" then return end
+	remote.Fire = function(selfRef, ...)
+		if not CAPTURE_DENYLIST[label] and labelMatchesFilter(label) then
+			local now = os.clock()
+			if (now - (captureLastPrint[label] or -math.huge)) >= 1 then
+				captureLastPrint[label] = now
+				local n = select("#", ...)
+				local parts = {}
+				for i = 1, n do
+					parts[i] = describeArg(i, (select(i, ...)))
+				end
+				pcall(function()
+					print("[CAPTURE] " .. label .. ":Fire(" .. table.concat(parts, ", ") .. ")")
+				end)
+			end
+		end
+		return orig(selfRef, ...)
+	end
+end
+
 local function installCapture(focused)
-    local keywords = focused and { "pet", "tame", "wild", "steal" } or nil
-    if captureInstalled then
-        print("[Capture] Already installed. Keywords: " .. (focused and "FOCUSED" or "all"))
-        return
-    end
-    captureInstalled = true
-    local count = 0
-    local lastPrint = {}
-    for sName, service in pairs(Networking) do
-        if type(service) == "table" then
-            local function wrap(label, remote)
-                local orig = remote.Fire
-                if type(orig) ~= "function" then return end
-                remote.Fire = function(self, ...)
-                    if not CAPTURE_DENYLIST[label] then
-                        local pass = true
-                        if keywords then
-                            pass = false
-                            local low = label:lower()
-                            for _, kw in ipairs(keywords) do
-                                if low:find(kw, 1, true) then pass = true; break end
-                            end
-                        end
-                        if pass then
-                            local now = os.clock()
-                            if (now - (lastPrint[label] or -math.huge)) >= 0.5 then
-                                lastPrint[label] = now
-                                local n = select("#", ...)
-                                local parts = {}
-                                for i = 1, n do
-                                    local v = select(i, ...)
-                                    local t = typeof(v)
-                                    parts[i] = t == "Instance"
-                                        and string.format("[%d] %s = %s", i, t, v:GetFullName())
-                                        or  string.format("[%d] %s = %s", i, t, tostring(v))
-                                end
-                                print("[CAPTURE] " .. label .. ":Fire(" .. table.concat(parts, ", ") .. ")")
-                            end
-                        end
-                    end
-                    return orig(self, ...)
-                end
-                count += 1
-            end
-            if type(service.Fire) == "function" and service.Id ~= nil then
-                wrap(sName, service)
-            else
-                for rName, remote in pairs(service) do
-                    if type(remote) == "table" and type(remote.Fire) == "function" then
-                        wrap(sName .. "." .. rName, remote)
-                    end
-                end
-            end
-        end
-    end
-    print(string.format("[Capture] Installed on %d remotes.", count))
-    Rayfield:Notify({ Title = "Capture", Content = string.format("Hooked %d remotes. Check output.", count), Duration = 4 })
+	captureKeywords = focused and { "pet", "tame", "wild", "steal" } or nil
+
+	if captureInstalled then
+		print("[Capture] Filter set to: " .. (focused and "PET/STEAL-ONLY" or "everything"))
+		return
+	end
+	captureInstalled = true
+	local count = 0
+	for serviceName, service in pairs(Networking) do
+		if type(service) == "table" then
+			if type(service.Fire) == "function" and service.Id ~= nil then
+				wrapRemoteFire(serviceName, service); count += 1
+			else
+				for remoteName, remote in pairs(service) do
+					if type(remote) == "table" and type(remote.Fire) == "function" then
+						wrapRemoteFire(serviceName .. "." .. remoteName, remote); count += 1
+					end
+				end
+			end
+		end
+	end
+	print(string.format("[Capture] Installed on %d remotes. Filter: %s", count, focused and "FOCUSED" or "everything"))
 end
 
 --==================================================================
--- MAIN LOOPS
+-- LOOPS
 --==================================================================
 
--- Stay in center loop (skips when taming or stealing)
 task.spawn(function()
-    while running do
-        task.wait(0.4)
-        if STAY_IN_CENTER and not taming and not stealing and not sweeping and not collecting then
-            local hrp = getHRP()
-            local center = getGardenCenterCFrame()
-            if hrp and center then
-                local d = (hrp.Position - center.Position)
-                if Vector3.new(d.X, 0, d.Z).Magnitude > 6 then
-                    hrp.CFrame = center
-                end
-            end
-        end
-    end
+	while running do
+		task.wait(0.3)
+		if running and STAY_IN_CENTER
+			and not stealing and not collecting and not petTaming and not taming then
+			local hrp = getHRP()
+			local center = getGardenCenterCFrame()
+			if hrp and center then
+				local d = hrp.Position - center.Position
+				if Vector3.new(d.X, 0, d.Z).Magnitude > 8 then
+					hrp.CFrame = center
+				end
+			end
+		end
+	end
 end)
 
--- Harvest loop
 task.spawn(function()
-    while running do
-        task.wait(LOOP_INTERVAL)
-        if running and enabled and not sweeping then
-            sweeping = true
-            if DO_HARVEST    then pcall(activateHarvestPrompts) end
-            if DO_SEED_PACKS then pcall(activateSeedPackPrompts) end
-            sweeping = false
-        end
-    end
+	while running do
+		task.wait(LOOP_INTERVAL)
+		if running and enabled and not sweeping then
+			sweeping = true
+			if DO_HARVEST    then activateHarvestPrompts()  end
+			if DO_SEED_PACKS then activateSeedPackPrompts() end
+			sweeping = false
+		end
+	end
 end)
 
--- Auto buy shop loop
 task.spawn(function()
-    while running do
-        task.wait(1)
-        if running and autoBuySeeds  then pcall(function() buyShop(getSeedShopFrame,  Networking.SeedShop.PurchaseSeed,   selectedSeeds)  end) end
-        if running and autoBuyGear   then pcall(function() buyShop(getGearShopFrame,  Networking.GearShop.PurchaseGear,   selectedGear)   end) end
-        if running and autoBuyCrates then pcall(function() buyShop(getCrateShopFrame, Networking.CrateShop.PurchaseCrate, selectedCrates) end) end
-    end
+	while running do
+		task.wait(1)
+		if running and autoBuySeeds then
+			pcall(function() buyShop(getSeedShopFrame, Networking.SeedShop.PurchaseSeed, selectedSeeds) end)
+		end
+		if running and autoBuyGear then
+			pcall(function() buyShop(getGearShopFrame, Networking.GearShop.PurchaseGear, selectedGear) end)
+		end
+		if running and autoBuyCrates then
+			pcall(function() buyShop(getCrateShopFrame, Networking.CrateShop.PurchaseCrate, selectedCrates) end)
+		end
+	end
 end)
 
--- Auto sell loop
 task.spawn(function()
-    while running do
-        task.wait(POLL_INTERVAL)
-        if running and AUTO_SELL and isInventoryFull() then
-            pcall(function()
-                local result = Networking.NPCS.SellAll:Fire()
-                if result and result.Success then
-                    print(string.format("[AutoSell] Sold %d items for %s", result.SoldCount, tostring(result.SellPrice)))
-                    Rayfield:Notify({ Title = "Auto Sell", Content = string.format("Sold %d items!", result.SoldCount), Duration = 3 })
-                end
-            end)
-        end
-    end
+	while running do
+		task.wait(POLL_INTERVAL)
+		if running and AUTO_SELL and isInventoryFull() then
+			pcall(function()
+				local result = Networking.NPCS.SellAll:Fire()
+				if result and result.Success then
+					print(string.format("[AutoHarvest] Inventory full - sold %d for %s", result.SoldCount, tostring(result.SellPrice)))
+				end
+			end)
+		end
+	end
 end)
 
--- Collect seed packs loop
 task.spawn(function()
-    while running do
-        task.wait(COLLECT_INTERVAL)
-        if running and AUTO_COLLECT and not collecting then
-            collecting = true
-            pcall(collectSeedPacks)
-            collecting = false
-        end
-    end
+	while running do
+		task.wait(COLLECT_INTERVAL)
+		if running and AUTO_COLLECT and not collecting then
+			collecting = true
+			pcall(collectSeedPacks)
+			collecting = false
+		end
+	end
 end)
 
--- Auto tame loop
 task.spawn(function()
-    while running do
-        task.wait(1)
-        if running and AUTO_PETS and not taming then
-            pcall(autoTamePets)
-        end
-    end
+	while running do
+		task.wait(0.6)
+		if running and AUTO_PETS and not petTaming then
+			pcall(autoTamePets)
+		end
+	end
 end)
 
--- Auto steal loop
+-- Steal Loop
 task.spawn(function()
-    while running do
-        task.wait(3)
-        if running and AUTO_STEAL and not stealing then
-            pcall(doAutoSteal)
-        end
-    end
+	while running do
+		task.wait(2)
+		if running and AUTO_STEAL and not stealing then
+			pcall(doAutoSteal)
+		end
+	end
 end)
 
 --==================================================================
--- RAYFIELD WINDOW
+-- UI LIBRARY (dark, animated, accented)
 --==================================================================
-local Window = Rayfield:CreateWindow({
-    Name             = "Garden Hub",
-    LoadingTitle     = "Garden Hub",
-    LoadingSubtitle  = "by AutoHarvest",
-    ConfigurationSaving = { Enabled = false },
-    Discord          = { Enabled = false },
-    KeySystem        = false,
-})
+local Theme = {
+	BG        = Color3.fromRGB(18, 18, 22),
+	Header   = Color3.fromRGB(24, 24, 30),
+	Panel    = Color3.fromRGB(22, 22, 27),
+	Row      = Color3.fromRGB(30, 30, 37),
+	RowHover = Color3.fromRGB(38, 38, 47),
+	Tab      = Color3.fromRGB(28, 28, 35),
+	TabOn    = Color3.fromRGB(196, 38, 46),
+	Accent   = Color3.fromRGB(220, 44, 52),
+	AccentDk = Color3.fromRGB(140, 26, 32),
+	Text     = Color3.fromRGB(240, 240, 245),
+	SubText  = Color3.fromRGB(140, 140, 150),
+	Off      = Color3.fromRGB(52, 52, 62),
+}
+
+local TW_FAST = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TW_MED  = TweenInfo.new(0.28, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+
+local function tw(obj, info, props)
+	local t = TweenService:Create(obj, info, props)
+	t:Play()
+	return t
+end
+
+local function corner(parent, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r or 8)
+	c.Parent = parent
+	return c
+end
+
+local function stroke(parent, color, thickness, transparency)
+	local s = Instance.new("UIStroke")
+	s.Color = color or Theme.AccentDk
+	s.Thickness = thickness or 1
+	s.Transparency = transparency or 0
+	s.Parent = parent
+	return s
+end
+
+local function gradient(parent, c1, c2, rot)
+	local g = Instance.new("UIGradient")
+	g.Color = ColorSequence.new(c1, c2)
+	g.Rotation = rot or 90
+	g.Parent = parent
+	return g
+end
+
+local Library = {}
+Library.__index = Library
+
+function Library.new(title)
+	local self = setmetatable({}, Library)
+	self.tabs = {}
+
+	-- Size to the screen. On phones the desktop 420x500 panel overflows, so we
+	-- shrink to fit the viewport and dock to the left edge with a small margin.
+	local cam = Workspace.CurrentCamera
+	local vp  = (cam and cam.ViewportSize) or Vector2.new(1280, 720)
+	local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+	local UI_W   = isMobile and math.floor(math.min(330, vp.X * 0.92)) or 420
+	local UI_H   = isMobile and math.floor(math.min(430, vp.Y * 0.82)) or 500
+	local UI_MIN = isMobile and 92 or 100
+	local UI_X   = isMobile and 8 or 40
+	self.uiW, self.uiH, self.uiMin = UI_W, UI_H, UI_MIN
+	self.isMobile = isMobile
+	self.tabW = isMobile and 58 or 68
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name           = "CustomHarvestGui"
+	gui.ResetOnSpawn   = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.IgnoreGuiInset = true
+	gui.Parent         = player:WaitForChild("PlayerGui")
+	self.gui = gui
+
+	local main = Instance.new("Frame")
+	main.Size = UDim2.fromOffset(UI_W, 0)
+	main.Position          = UDim2.new(0, UI_X, 0.5, -math.floor(UI_H / 2))
+	main.BackgroundColor3  = Theme.BG
+	main.BorderSizePixel   = 0
+	main.ClipsDescendants  = true
+	main.Parent            = gui
+	corner(main, 14)
+	stroke(main, Theme.AccentDk, 1.5, 0.2)
+	self.main = main
+
+	main.Size = UDim2.fromOffset(UI_W, 0)
+	tw(main, TW_MED, { Size = UDim2.fromOffset(UI_W, UI_H) })
+
+	local header = Instance.new("Frame")
+	header.Size             = UDim2.new(1, 0, 0, 46)
+	header.BackgroundColor3 = Theme.Header
+	header.BorderSizePixel  = 0
+	header.Parent          = main
+	gradient(header, Theme.Header, Color3.fromRGB(30, 22, 24), 25)
+
+	local accentBar = Instance.new("Frame")
+	accentBar.Size             = UDim2.new(0, 4, 1, -16)
+	accentBar.Position         = UDim2.fromOffset(0, 8)
+	accentBar.BackgroundColor3 = Theme.Accent
+	accentBar.BorderSizePixel  = 0
+	accentBar.Parent           = header
+	corner(accentBar, 2)
+
+	local titleLbl = Instance.new("TextLabel")
+	titleLbl.Size             = UDim2.new(1, -130, 1, 0)
+	titleLbl.Position         = UDim2.fromOffset(18, 0)
+	titleLbl.BackgroundTransparency = 1
+	titleLbl.Font              = Enum.Font.GothamBold
+	titleLbl.TextSize         = 17
+	titleLbl.TextColor3       = Theme.Text
+	titleLbl.TextXAlignment   = Enum.TextXAlignment.Left
+	titleLbl.Text             = title or "Menu"
+	titleLbl.Parent           = header
+
+	local function makeHeaderBtn(text, xoff, color)
+		local b = Instance.new("TextButton")
+		b.Size             = UDim2.fromOffset(30, 30)
+		b.Position         = UDim2.new(1, xoff, 0, 8)
+		b.BackgroundColor3 = color
+		b.BorderSizePixel  = 0
+		b.Font             = Enum.Font.GothamBold
+		b.TextSize         = 16
+		b.TextColor3       = Theme.Text
+		b.Text             = text
+		b.AutoButtonColor  = false
+		b.Parent           = header
+		corner(b, 7)
+		track(b.MouseEnter:Connect(function() tw(b, TW_FAST, { BackgroundColor3 = Theme.Accent }) end))
+		track(b.MouseLeave:Connect(function() tw(b, TW_FAST, { BackgroundColor3 = color }) end))
+		return b
+	end
+
+	local content
+	local minimized = false
+	local minBtn = makeHeaderBtn("-", -76, Theme.Off)
+	local unloadBtn = makeHeaderBtn("X", -40, Theme.AccentDk)
+
+	track(unloadBtn.MouseButton1Click:Connect(function()
+		tw(main, TW_FAST, { Size = UDim2.fromOffset(UI_W, 0) })
+		task.wait(0.18)
+		unloadEverything()
+	end))
+
+	local tabBar = Instance.new("ScrollingFrame")
+	tabBar.Size                 = UDim2.new(1, -20, 0, 34)
+	tabBar.Position             = UDim2.fromOffset(10, 54)
+	tabBar.BackgroundTransparency = 1
+	tabBar.BorderSizePixel      = 0
+	tabBar.ScrollBarThickness   = 0  -- hidden scrollbar, swipe/scroll to navigate
+	tabBar.CanvasSize           = UDim2.new(0, 0, 0, 0)
+	tabBar.AutomaticCanvasSize  = Enum.AutomaticSize.X
+	tabBar.ScrollingDirection   = Enum.ScrollingDirection.X
+	tabBar.Parent               = main
+	self.tabBar = tabBar
+
+	local tabLayout = Instance.new("UIListLayout")
+	tabLayout.FillDirection = Enum.FillDirection.Horizontal
+	tabLayout.Padding       = UDim.new(0, 6)
+	tabLayout.SortOrder     = Enum.SortOrder.LayoutOrder
+	tabLayout.Parent        = tabBar
+
+	content = Instance.new("Frame")
+	content.Size             = UDim2.new(1, -20, 1, -98)
+	content.Position        = UDim2.fromOffset(10, 94)
+	content.BackgroundColor3 = Theme.Panel
+	content.BorderSizePixel  = 0
+	content.Parent           = main
+	corner(content, 10)
+	self.content = content
+
+	track(minBtn.MouseButton1Click:Connect(function()
+		minimized = not minimized
+		if minimized then
+			tw(main, TW_MED, { Size = UDim2.fromOffset(UI_W, UI_MIN) })
+			content.Visible = false
+		else
+			content.Visible = true
+			tw(main, TW_MED, { Size = UDim2.fromOffset(UI_W, UI_H) })
+		end
+	end))
+
+	local dragging, dragStart, startPos
+	track(header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true; dragStart = input.Position; startPos = main.Position
+		end
+	end))
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end))
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+
+	return self
+end
+
+function Library:AddTab(name)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(0, self.tabW or 68, 1, 0)
+	btn.BackgroundColor3 = Theme.Tab
+	btn.BorderSizePixel  = 0
+	btn.AutoButtonColor  = false
+	btn.Font             = Enum.Font.GothamSemibold
+	btn.TextSize         = self.isMobile and 12 or 13
+	btn.TextColor3        = Theme.SubText
+	btn.Text             = name
+	btn.Parent           = self.tabBar
+	corner(btn, 7)
+
+	local page = Instance.new("ScrollingFrame")
+	page.Size                   = UDim2.new(1, 0, 1, 0)
+	page.BackgroundTransparency = 1
+	page.BorderSizePixel        = 0
+	page.ScrollBarThickness     = 4
+	page.ScrollBarImageColor3   = Theme.Accent
+	page.CanvasSize             = UDim2.new(0, 0, 0, 0)
+	page.AutomaticCanvasSize    = Enum.AutomaticSize.Y
+	page.Visible                = false
+	page.Parent                 = self.content
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, 12); pad.PaddingBottom = UDim.new(0, 12)
+	pad.PaddingLeft = UDim.new(0, 12); pad.PaddingRight = UDim.new(0, 12)
+	pad.Parent = page
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = page
+
+	local tab = { btn = btn, page = page }
+	table.insert(self.tabs, tab)
+
+	track(btn.MouseButton1Click:Connect(function()
+		for _, t in ipairs(self.tabs) do
+			local on = (t == tab)
+			t.page.Visible = on
+			tw(t.btn, TW_FAST, {
+				BackgroundColor3 = on and Theme.TabOn or Theme.Tab,
+				TextColor3 = on and Theme.Text or Theme.SubText,
+			})
+		end
+	end))
+
+	if #self.tabs == 1 then
+		page.Visible = true
+		btn.BackgroundColor3 = Theme.TabOn
+		btn.TextColor3 = Theme.Text
+	end
+	return tab
+end
+
+function Library:AddToggle(tab, text, default, onChanged)
+	local holder = Instance.new("TextButton")
+	holder.Size             = UDim2.new(1, 0, 0, 42)
+	holder.BackgroundColor3 = Theme.Row
+	holder.BorderSizePixel  = 0
+	holder.AutoButtonColor   = false
+	holder.Font             = Enum.Font.GothamSemibold
+	holder.TextSize         = 14
+	holder.TextColor3       = Theme.Text
+	holder.TextXAlignment   = Enum.TextXAlignment.Left
+	holder.Text             = "    " .. text
+	holder.Parent           = tab.page
+	corner(holder, 8)
+
+	track(holder.MouseEnter:Connect(function() tw(holder, TW_FAST, { BackgroundColor3 = Theme.RowHover }) end))
+	track(holder.MouseLeave:Connect(function() tw(holder, TW_FAST, { BackgroundColor3 = Theme.Row }) end))
+
+	local pill = Instance.new("Frame")
+	pill.Size              = UDim2.fromOffset(44, 22)
+	pill.Position         = UDim2.new(1, -56, 0.5, -11)
+	pill.BackgroundColor3 = Theme.Off
+	pill.BorderSizePixel  = 0
+	pill.Parent           = holder
+	corner(pill, 11)
+
+	local knob = Instance.new("Frame")
+	knob.Size             = UDim2.fromOffset(18, 18)
+	knob.Position         = UDim2.fromOffset(2, 2)
+	knob.BackgroundColor3 = Theme.SubText
+	knob.BorderSizePixel  = 0
+	knob.Parent           = pill
+	corner(knob, 9)
+
+	local state = default and true or false
+	local function render(animate)
+		local info = animate and TW_FAST or TweenInfo.new(0)
+		tw(pill, info, { BackgroundColor3 = state and Theme.Accent or Theme.Off })
+		tw(knob, info, {
+			Position = state and UDim2.fromOffset(24, 2) or UDim2.fromOffset(2, 2),
+			BackgroundColor3 = state and Theme.Text or Theme.SubText,
+		})
+	end
+	render(false)
+
+	track(holder.MouseButton1Click:Connect(function()
+		state = not state
+		render(true)
+		if onChanged then onChanged(state) end
+	end))
+	return holder, function() return state end, function(v) state = v; render(true); if onChanged then onChanged(v) end end
+end
+
+function Library:AddButton(tab, text, callback)
+	local btn = Instance.new("TextButton")
+	btn.Size             = UDim2.new(1, 0, 0, 42)
+	btn.BackgroundColor3 = Theme.AccentDk
+	btn.BorderSizePixel  = 0
+	btn.AutoButtonColor  = false
+	btn.Font             = Enum.Font.GothamBold
+	btn.TextSize         = 14
+	btn.TextColor3       = Theme.Text
+	btn.Text             = text
+	btn.Parent           = tab.page
+	corner(btn, 8)
+	stroke(btn, Theme.Accent, 1, 0.3)
+
+	track(btn.MouseEnter:Connect(function() tw(btn, TW_FAST, { BackgroundColor3 = Theme.Accent }) end))
+	track(btn.MouseLeave:Connect(function() tw(btn, TW_FAST, { BackgroundColor3 = Theme.AccentDk }) end))
+	track(btn.MouseButton1Click:Connect(function()
+		tw(btn, TweenInfo.new(0.08), { BackgroundColor3 = Theme.Text })
+		task.wait(0.08)
+		tw(btn, TW_FAST, { BackgroundColor3 = Theme.Accent })
+		if callback then callback() end
+	end))
+	return btn
+end
+
+function Library:AddCheck(tab, text, default, onChanged)
+	local holder = Instance.new("TextButton")
+	holder.Size             = UDim2.new(1, 0, 0, 32)
+	holder.BackgroundColor3 = Theme.Row
+	holder.BorderSizePixel  = 0
+	holder.AutoButtonColor  = false
+	holder.Font             = Enum.Font.Gotham
+	holder.TextSize         = 13
+	holder.TextColor3       = Theme.Text
+	holder.TextXAlignment   = Enum.TextXAlignment.Left
+	holder.Text             = "    " .. text
+	holder.Parent           = tab.page
+	corner(holder, 6)
+
+	track(holder.MouseEnter:Connect(function() tw(holder, TW_FAST, { BackgroundColor3 = Theme.RowHover }) end))
+	track(holder.MouseLeave:Connect(function() tw(holder, TW_FAST, { BackgroundColor3 = Theme.Row }) end))
+
+	local box = Instance.new("Frame")
+	box.Size             = UDim2.fromOffset(20, 20)
+	box.Position         = UDim2.new(1, -30, 0.5, -10)
+	box.BackgroundColor3 = Theme.Off
+	box.BorderSizePixel  = 0
+	box.Parent           = holder
+	corner(box, 5)
+
+	local tick = Instance.new("Frame")
+	tick.AnchorPoint      = Vector2.new(0.5, 0.5)
+	tick.Position         = UDim2.fromScale(0.5, 0.5)
+	tick.BackgroundColor3 = Theme.Accent
+	tick.BorderSizePixel  = 0
+	tick.Parent           = box
+	corner(tick, 3)
+
+	local state = default and true or false
+	local function render(animate)
+		local info = animate and TW_FAST or TweenInfo.new(0)
+		tw(tick, info, { Size = state and UDim2.fromOffset(12, 12) or UDim2.fromOffset(0, 0) })
+		tw(box, info, { BackgroundColor3 = state and Color3.fromRGB(60, 30, 33) or Theme.Off })
+	end
+	render(false)
+
+	track(holder.MouseButton1Click:Connect(function()
+		state = not state
+		render(true)
+		if onChanged then onChanged(state) end
+	end))
+	return holder, function() return state end, function(v) state = v; render(true); if onChanged then onChanged(v) end end
+end
+
+function Library:AddLabel(tab, text)
+	local lbl = Instance.new("TextLabel")
+	lbl.Size             = UDim2.new(1, 0, 0, 18)
+	lbl.BackgroundTransparency = 1
+	lbl.Font             = Enum.Font.GothamBold
+	lbl.TextSize         = 11
+	lbl.TextColor3       = Theme.SubText
+	lbl.TextXAlignment   = Enum.TextXAlignment.Left
+	lbl.Text             = string.upper(text)
+	lbl.Parent           = tab.page
+	return lbl
+end
+
+function Library:AddTextBox(tab, text, placeholder, onSubmit)
+	local holder = Instance.new("Frame")
+	holder.Size             = UDim2.new(1, 0, 0, 38)
+	holder.BackgroundColor3 = Theme.Row
+	holder.BorderSizePixel  = 0
+	holder.Parent           = tab.page
+	corner(holder, 8)
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size             = UDim2.new(0.5, -8, 1, 0)
+	lbl.Position         = UDim2.fromOffset(12, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.Font             = Enum.Font.GothamSemibold
+	lbl.TextSize         = 13
+	lbl.TextColor3       = Theme.Text
+	lbl.TextXAlignment   = Enum.TextXAlignment.Left
+	lbl.Text             = text
+	lbl.Parent           = holder
+
+	local box = Instance.new("TextBox")
+	box.Size             = UDim2.new(0.5, -8, 0, 28)
+	box.Position         = UDim2.new(0.5, 0, 0.5, -14)
+	box.BackgroundColor3 = Theme.BG
+	box.BorderSizePixel  = 0
+	box.Font             = Enum.Font.Gotham
+	box.TextSize         = 12
+	box.TextColor3       = Theme.Text
+	box.PlaceholderText  = placeholder or ""
+	box.PlaceholderColor3 = Theme.SubText
+	box.Text             = ""
+	box.ClearTextOnFocus = false
+	box.Parent           = holder
+	corner(box, 6)
+	stroke(box, Theme.AccentDk, 1, 0.4)
+
+	track(box.FocusLost:Connect(function(enterPressed)
+		if enterPressed and onSubmit then
+			onSubmit(box.Text)
+		end
+	end))
+	return holder, box
+end
 
 --==================================================================
--- FARM TAB
+-- BUILD THE WINDOW
 --==================================================================
-local FarmTab = Window:CreateTab("Farm", "sprout")
+local win = Library.new("Garden Hub")
 
-FarmTab:CreateToggle({
-    Name         = "Auto Harvest",
-    CurrentValue = enabled,
-    Flag         = "AutoHarvest",
-    Callback     = function(v) enabled = v end,
-})
+local farmTab   = win:AddTab("Farm")
+local shopTab   = win:AddTab("Shop")
+local petTab    = win:AddTab("Pets")
+local stealTab  = win:AddTab("Steal")
+local visualTab = win:AddTab("Visuals")
+local configTab = win:AddTab("Config")
 
-FarmTab:CreateToggle({
-    Name         = "Auto Sell (when full)",
-    CurrentValue = AUTO_SELL,
-    Flag         = "AutoSell",
-    Callback     = function(v) AUTO_SELL = v end,
-})
+-- Farm Tab
+win:AddLabel(farmTab, "Automation")
+local _, getEnabled, setEnabled = win:AddToggle(farmTab, "Auto Harvest", enabled, function(v) enabled = v end)
+local _, getAutoSell, setAutoSell = win:AddToggle(farmTab, "Auto Sell (at full)", AUTO_SELL, function(v) AUTO_SELL = v end)
+local _, getAutoCollect, setAutoCollect = win:AddToggle(farmTab, "Auto Collect Seeds", AUTO_COLLECT, function(v) AUTO_COLLECT = v end)
+local _, getHidePlots, setHidePlots = win:AddToggle(farmTab, "Hide Other Plots", HIDE_OTHER_PLOTS, function(v) HIDE_OTHER_PLOTS = v; setOtherPlotsHidden(v) end)
+local _, getAntiAfk, setAntiAfk = win:AddToggle(farmTab, "Anti-AFK", ANTI_AFK, function(v) ANTI_AFK = v end)
+local _, getStayCenter, setStayCenter = win:AddToggle(farmTab, "Stay in Center", STAY_IN_CENTER, function(v) STAY_IN_CENTER = v end)
+local _, getSkipLoad, setSkipLoad = win:AddToggle(farmTab, "Auto Skip Loading Screen", AUTO_SKIP_LOADING, function(v)
+	AUTO_SKIP_LOADING = v
+	if v then runAutoSkip() end
+end)
+win:AddButton(farmTab, "Skip Loading Now", function() trySkipLoadingScreen() end)
+win:AddLabel(farmTab, "Best as an autoload config - applies on join.")
 
-FarmTab:CreateToggle({
-    Name         = "Auto Collect Seeds",
-    CurrentValue = AUTO_COLLECT,
-    Flag         = "AutoCollect",
-    Callback     = function(v) AUTO_COLLECT = v end,
-})
+-- Shop Tab
+win:AddLabel(shopTab, "Buy All (in-stock)")
+win:AddButton(shopTab, "Buy All Seeds",  function() task.spawn(buyAllSeeds)  end)
+win:AddButton(shopTab, "Buy All Gear",   function() task.spawn(buyAllGear)   end)
+win:AddButton(shopTab, "Buy All Crates", function() task.spawn(buyAllCrates) end)
 
-FarmTab:CreateToggle({
-    Name         = "Hide Other Plots",
-    CurrentValue = HIDE_OTHER_PLOTS,
-    Flag         = "HidePlots",
-    Callback     = function(v) HIDE_OTHER_PLOTS = v; setOtherPlotsHidden(v) end,
-})
+win:AddLabel(shopTab, "Auto-Buy Selected")
+local _, getAutoBuySeeds, setAutoBuySeeds = win:AddToggle(shopTab, "Auto-Buy Seeds",  autoBuySeeds,  function(v) autoBuySeeds  = v end)
+local _, getAutoBuyGear, setAutoBuyGear = win:AddToggle(shopTab, "Auto-Buy Gear",   autoBuyGear,   function(v) autoBuyGear   = v end)
+local _, getAutoBuyCrates, setAutoBuyCrates = win:AddToggle(shopTab, "Auto-Buy Crates", autoBuyCrates, function(v) autoBuyCrates = v end)
 
-FarmTab:CreateToggle({
-    Name         = "Anti-AFK",
-    CurrentValue = ANTI_AFK,
-    Flag         = "AntiAFK",
-    Callback     = function(v) ANTI_AFK = v end,
-})
+local function buildChecklist(getFrame, selectionTable, rowStore)
+	for _, row in ipairs(rowStore) do row:Destroy() end
+	table.clear(rowStore)
+	local frame = getFrame()
+	if not frame then
+		rowStore[#rowStore+1] = win:AddLabel(shopTab, "Open that shop in-game, then Refresh.")
+		return
+	end
+	for _, child in ipairs(frame:GetChildren()) do
+		local main = child:IsA("Frame") and child:FindFirstChild("Main_Frame")
+		if main and main:FindFirstChild("Stock_Text") then
+			local name = child.Name
+			local row = win:AddCheck(shopTab, name, selectionTable[name] == true, function(on)
+				selectionTable[name] = on or nil
+			end)
+			rowStore[#rowStore+1] = row
+		end
+	end
+end
 
-FarmTab:CreateToggle({
-    Name         = "Stay in Garden Center",
-    CurrentValue = STAY_IN_CENTER,
-    Flag         = "StayCenter",
-    Callback     = function(v) STAY_IN_CENTER = v end,
-})
+local seedRows, gearRows, crateRows = {}, {}, {}
 
-FarmTab:CreateSection("Diagnostics")
+win:AddLabel(shopTab, "Seed Selection")
+win:AddButton(shopTab, "Refresh Seed List", function() buildChecklist(getSeedShopFrame, selectedSeeds, seedRows) end)
+win:AddLabel(shopTab, "Gear Selection")
+win:AddButton(shopTab, "Refresh Gear List", function() buildChecklist(getGearShopFrame, selectedGear, gearRows) end)
+win:AddLabel(shopTab, "Crate Selection")
+win:AddButton(shopTab, "Refresh Crate List", function() buildChecklist(getCrateShopFrame, selectedCrates, crateRows) end)
+buildChecklist(getSeedShopFrame, selectedSeeds, seedRows)
 
-FarmTab:CreateButton({
-    Name     = "Debug Garden Info",
-    Callback = function()
-        local garden = getMyGarden()
-        if not garden then
-            Rayfield:Notify({ Title = "Farm", Content = "No garden found for " .. player.Name, Duration = 4 })
-            return
-        end
-        local plants  = garden:FindFirstChild("Plants")
-        local pCount  = plants and #plants:GetChildren() or 0
-        local fCount  = 0
-        if plants then
-            for _, plant in ipairs(plants:GetChildren()) do
-                local fruits = plant:FindFirstChild("Fruits")
-                if fruits then fCount += #fruits:GetChildren() end
-            end
-        end
-        local msg = string.format("Plants: %d | Fruits: %d | Center: %s",
-            pCount, fCount, tostring(getGardenCenterCFrame() ~= nil))
-        Rayfield:Notify({ Title = "Garden Info", Content = msg, Duration = 5 })
-        print("[Farm]", msg)
-    end,
-})
+-- Pet Tab
+win:AddLabel(petTab, "Wild Pet Auto-Tame")
+local _, getAutoPets, setAutoPets = win:AddToggle(petTab, "Auto-Tame Pets", AUTO_PETS, function(v) AUTO_PETS = v end)
+local _, getTameTp, setTameTp = win:AddToggle(petTab, "Fast Tame (teleport to pet)", TAME_TELEPORT, function(v) TAME_TELEPORT = v end)
+win:AddLabel(petTab, "Teleport is required - taming is distance-checked.")
 
---==================================================================
--- SHOP TAB
---==================================================================
-local ShopTab = Window:CreateTab("Shop", "shopping-cart")
+-- Master roster: select any pet whether or not it's spawned right now, the same
+-- way the seed shop lets you pick seeds that aren't currently in stock.
+local petRows = {}
+local function refreshPetNames()
+	for _, row in ipairs(petRows) do row:Destroy() end
+	table.clear(petRows)
 
-ShopTab:CreateSection("Buy All In-Stock")
+	refreshKnownPetsFromAssets()   -- full roster from Assets.Pets (always available)
+	refreshKnownPetsFromWorld()    -- plus anything spawned not in that folder
 
-ShopTab:CreateButton({ Name = "Buy All Seeds",  Callback = function() task.spawn(buyAllSeeds);  Rayfield:Notify({ Title = "Shop", Content = "Seeds bought!", Duration = 2 }) end })
-ShopTab:CreateButton({ Name = "Buy All Gear",   Callback = function() task.spawn(buyAllGear);   Rayfield:Notify({ Title = "Shop", Content = "Gear bought!", Duration = 2 }) end })
-ShopTab:CreateButton({ Name = "Buy All Crates", Callback = function() task.spawn(buyAllCrates); Rayfield:Notify({ Title = "Shop", Content = "Crates bought!", Duration = 2 }) end })
+	local names = {}
+	for name in pairs(knownPetNames) do names[#names+1] = name end
+	table.sort(names)
 
-ShopTab:CreateSection("Auto-Buy Toggles")
+	for _, n in ipairs(names) do
+		local row = win:AddCheck(petTab, n, selectedPetNames[n] == true, function(on)
+			selectedPetNames[n] = on or nil
+		end)
+		petRows[#petRows+1] = row
+	end
 
-ShopTab:CreateToggle({ Name = "Auto-Buy Seeds",  CurrentValue = autoBuySeeds,  Flag = "AutoSeeds",  Callback = function(v) autoBuySeeds  = v end })
-ShopTab:CreateToggle({ Name = "Auto-Buy Gear",   CurrentValue = autoBuyGear,   Flag = "AutoGear",   Callback = function(v) autoBuyGear   = v end })
-ShopTab:CreateToggle({ Name = "Auto-Buy Crates", CurrentValue = autoBuyCrates, Flag = "AutoCrates", Callback = function(v) autoBuyCrates = v end })
+	if #petRows == 0 then
+		petRows[#petRows+1] = win:AddLabel(petTab, "No pets known yet - add one below.")
+	end
+end
 
---==================================================================
--- PETS TAB
---==================================================================
-local PetTab = Window:CreateTab("Pets", "paw-print")
+win:AddLabel(petTab, "Select Pets (empty = tame all)")
+win:AddButton(petTab, "Refresh Pet List", function() refreshPetNames() end)
+win:AddTextBox(petTab, "Add Pet Name", "exact pet name", function(text)
+	if addKnownPet(text) then
+		print("[Pets] Added '" .. text .. "' to list.")
+		refreshPetNames()
+	end
+end)
+win:AddButton(petTab, "Test Tame First Pet", function() testTameFirstPet() end)
+win:AddButton(petTab, "Debug Pets (check output)", function() debugWildPets() end)
+win:AddButton(petTab, "Capture Pet Calls Only (then tame)", function() installCapture(true) end)
+win:AddButton(petTab, "Capture ALL Calls (then tame)", function() installCapture(false) end)
+win:AddButton(petTab, "Test Ref Folder", function()
+	local refFolder = findWildPetRefFolder()
+	if not refFolder then
+		warn("[Pets] WildPetRef folder NOT found.")
+		local map = Workspace:FindFirstChild("Map")
+		if map then for _,c in ipairs(map:GetChildren()) do print("  Map >", c.Name, c.ClassName) end end
+		return
+	end
+	print("[Pets] Found:", refFolder:GetFullName())
+	local kids = refFolder:GetChildren()
+	print("[Pets] ref parts:", #kids)
+	for i,p in ipairs(kids) do
+		if i > 3 then break end
+		print(string.format("  [%d] %s (%s)", i, p.Name, p.ClassName))
+		print("       tame fired ->", p:GetFullName())
+		fireTameAt(p, nil)
+	end
+end)
+-- Populate the roster immediately on build so all pets show up without waiting.
+refreshPetNames()
 
-PetTab:CreateToggle({
-    Name         = "Auto-Tame Pets",
-    CurrentValue = AUTO_PETS,
-    Flag         = "AutoPets",
-    Callback     = function(v) AUTO_PETS = v end,
-})
+-- Steal Tab
+win:AddLabel(stealTab, "Auto Steal")
+local _, getAutoSteal, setAutoSteal = win:AddToggle(stealTab, "Auto Steal (Selected Targets)", AUTO_STEAL, function(v) AUTO_STEAL = v end)
+win:AddButton(stealTab, "Complete Steal", function() pcall(function() Networking.Steal.CompleteSteal:Fire() end) end)
+win:AddButton(stealTab, "Cancel Steal", function() pcall(function() Networking.Steal.CancelSteal:Fire() end) end)
 
-PetTab:CreateToggle({
-    Name         = "Teleport to Pet (required)",
-    CurrentValue = TAME_TELEPORT,
-    Flag         = "TameTeleport",
-    Callback     = function(v) TAME_TELEPORT = v end,
-})
+local stealRows = {}
+local function refreshStealTargets()
+	for _, row in ipairs(stealRows) do row:Destroy() end
+	table.clear(stealRows)
+	local gardens = getOtherGardens()
+	local seen = {}
+	for _, garden in ipairs(gardens) do
+		local ownerName = garden:GetAttribute("Owner")
+		if ownerName and not seen[ownerName] then
+			seen[ownerName] = true
+			local row = win:AddCheck(stealTab, ownerName, selectedStealTargets[ownerName] == true, function(on)
+				selectedStealTargets[ownerName] = on or nil
+			end)
+			stealRows[#stealRows+1] = row
+		end
+	end
+	if #stealRows == 0 then
+		stealRows[#stealRows+1] = win:AddLabel(stealTab, "No other player gardens found nearby.")
+	end
+end
+win:AddLabel(stealTab, "Target Selection")
+win:AddButton(stealTab, "Refresh Targets", function() refreshStealTargets() end)
+refreshStealTargets()
 
-PetTab:CreateSection("Pet Filter (empty = tame all)")
-
-PetTab:CreateInput({
-    Name        = "Add Pet Name",
-    PlaceholderText = "Exact pet name",
-    RemoveTextAfterFocusLost = true,
-    Callback    = function(text)
-        if addKnownPet(text) then
-            Rayfield:Notify({ Title = "Pets", Content = "Added: " .. text, Duration = 3 })
-        end
-    end,
-})
-
-PetTab:CreateSection("Actions")
-
-PetTab:CreateButton({ Name = "Test Tame First Pet",       Callback = function() task.spawn(testTameFirstPet) end })
-PetTab:CreateButton({ Name = "Debug Pets (output)",       Callback = function() task.spawn(debugWildPets) end })
-PetTab:CreateButton({ Name = "Refresh Known Pets",        Callback = function()
-    refreshKnownPetsFromAssets()
-    refreshKnownPetsFromWorld()
-    local names = {}
-    for n in pairs(knownPetNames) do names[#names+1] = n end
-    table.sort(names)
-    Rayfield:Notify({ Title = "Pets", Content = #names .. " pets known: " .. table.concat(names, ", "), Duration = 6 })
-end })
-PetTab:CreateButton({ Name = "Capture Pet Remotes",       Callback = function() installCapture(true) end })
-PetTab:CreateButton({ Name = "Capture ALL Remotes",       Callback = function() installCapture(false) end })
-
-PetTab:CreateSection("Select Pets to Filter")
-PetTab:CreateButton({ Name = "Open Pet Selector (output)", Callback = function()
-    refreshKnownPetsFromAssets()
-    refreshKnownPetsFromWorld()
-    local names = {}
-    for n in pairs(knownPetNames) do names[#names+1] = n end
-    table.sort(names)
-    if #names == 0 then
-        Rayfield:Notify({ Title = "Pets", Content = "No known pets yet. Refresh first.", Duration = 3 })
-        return
-    end
-    print("[Pets] Known pets (use 'Add Pet Name' to filter):")
-    for _, n in ipairs(names) do
-        print(string.format("  [%s] %s", selectedPetNames[n] and "X" or " ", n))
-    end
-    Rayfield:Notify({ Title = "Pets", Content = "Check output for pet list.", Duration = 4 })
-end })
-
---==================================================================
--- STEAL TAB
---==================================================================
-local StealTab = Window:CreateTab("Steal", "scissors")
-
-StealTab:CreateToggle({
-    Name         = "Auto Steal",
-    CurrentValue = AUTO_STEAL,
-    Flag         = "AutoSteal",
-    Callback     = function(v) AUTO_STEAL = v end,
-})
-
-StealTab:CreateToggle({
-    Name         = "Steal Highest Value First",
-    CurrentValue = STEAL_HIGHEST_VALUE,
-    Flag         = "StealHighest",
-    Callback     = function(v) STEAL_HIGHEST_VALUE = v end,
-})
-
-StealTab:CreateInput({
-    Name            = "Steal Amount (0 = unlimited)",
-    PlaceholderText = "0",
-    RemoveTextAfterFocusLost = false,
-    Callback        = function(text)
-        local n = tonumber(text)
-        STEAL_AMOUNT = (n and n >= 0) and math.floor(n) or 0
-        Rayfield:Notify({ Title = "Steal", Content = "Amount set to " .. (STEAL_AMOUNT == 0 and "unlimited" or tostring(STEAL_AMOUNT)), Duration = 3 })
-    end,
-})
-
-StealTab:CreateSection("Night Status")
-
-local nightStatusLabel
-task.spawn(function()
-    while running do
-        task.wait(2)
-        local nightVal = ReplicatedStorage:FindFirstChild("Night")
-        local isNight = nightVal and nightVal.Value == true
-        -- We can't update Rayfield labels dynamically, so just print
-        if isNight then
-            print("[AutoSteal] 🌙 NIGHT - stealing is active")
-        end
-    end
+local _, stealAmountBox = win:AddTextBox(stealTab, "Steal Amount (0 = all)", "0", function(text)
+	local n = tonumber(text)
+	STEAL_AMOUNT = (n and n >= 0) and math.floor(n) or 0
+	print("[AutoSteal] Steal amount = " .. (STEAL_AMOUNT == 0 and "ALL" or tostring(STEAL_AMOUNT)))
 end)
 
-StealTab:CreateButton({ Name = "Check Night Status", Callback = function()
-    local nightVal = ReplicatedStorage:FindFirstChild("Night")
-    local msg = nightVal and (nightVal.Value and "🌙 IT IS NIGHT" or "☀ NOT NIGHT") or "Night value not found"
-    Rayfield:Notify({ Title = "Night Status", Content = msg, Duration = 4 })
-end })
+-- Visual Tab
+win:AddLabel(visualTab, "Performance")
+win:AddButton(visualTab, "Strip Textures + Particles", function() stripVisuals() end)
+win:AddLabel(visualTab, "Removes decals/textures, smooths parts,")
+win:AddLabel(visualTab, "disables particles/trails/beams/smoke/fire.")
 
-StealTab:CreateSection("Target Selection")
-
-StealTab:CreateButton({ Name = "Refresh Steal Targets", Callback = function()
-    local gardens = getOtherGardens()
-    if #gardens == 0 then
-        Rayfield:Notify({ Title = "Steal", Content = "No other gardens found.", Duration = 3 })
-        return
-    end
-    local names = {}
-    for _, garden in ipairs(gardens) do
-        local ownerName = garden:GetAttribute("Owner")
-        if ownerName then names[#names+1] = ownerName end
-    end
-    Rayfield:Notify({ Title = "Steal Targets", Content = "Found: " .. table.concat(names, ", "), Duration = 6 })
-    print("[Steal] Gardens found:")
-    for _, n in ipairs(names) do
-        print(string.format("  [%s] %s", selectedStealTargets[n] and "X" or " ", n))
-    end
-end })
-
-StealTab:CreateInput({
-    Name            = "Add Target (player name)",
-    PlaceholderText = "Exact username",
-    RemoveTextAfterFocusLost = true,
-    Callback        = function(text)
-        if text and text ~= "" then
-            selectedStealTargets[text] = true
-            Rayfield:Notify({ Title = "Steal", Content = "Added target: " .. text, Duration = 3 })
-        end
-    end,
-})
-
-StealTab:CreateInput({
-    Name            = "Remove Target (player name)",
-    PlaceholderText = "Exact username",
-    RemoveTextAfterFocusLost = true,
-    Callback        = function(text)
-        if text and text ~= "" then
-            selectedStealTargets[text] = nil
-            Rayfield:Notify({ Title = "Steal", Content = "Removed target: " .. text, Duration = 3 })
-        end
-    end,
-})
-
-StealTab:CreateSection("Manual Controls")
-
-StealTab:CreateButton({ Name = "Complete Steal Now", Callback = function()
-    pcall(function() Networking.Steal.CompleteSteal:Fire() end)
-    Rayfield:Notify({ Title = "Steal", Content = "CompleteSteal fired.", Duration = 2 })
-end })
-
-StealTab:CreateButton({ Name = "Cancel Steal Now", Callback = function()
-    pcall(function() Networking.Steal.CancelSteal:Fire() end)
-    Rayfield:Notify({ Title = "Steal", Content = "CancelSteal fired.", Duration = 2 })
-end })
-
-StealTab:CreateButton({ Name = "Debug Steal Targets", Callback = function()
-    local nightVal = ReplicatedStorage:FindFirstChild("Night")
-    print("[Debug] Night:", nightVal and tostring(nightVal.Value) or "nil")
-    print("[Debug] Other gardens:", #getOtherGardens())
-    for _, garden in ipairs(getOtherGardens()) do
-        local ownerName = garden:GetAttribute("Owner")
-        local plants    = garden:FindFirstChild("Plants")
-        local pCount    = plants and #plants:GetChildren() or 0
-        local fCount, prCount = 0, 0
-        if plants then
-            for _, plant in ipairs(plants:GetChildren()) do
-                local fruits = plant:FindFirstChild("Fruits")
-                if fruits then
-                    fCount += #fruits:GetChildren()
-                    for _, fruit in ipairs(fruits:GetChildren()) do
-                        local hp = fruit:FindFirstChild("HarvestPart")
-                        if hp then
-                            for _, d in ipairs(hp:GetDescendants()) do
-                                if d:IsA("ProximityPrompt") and d:HasTag("StealPrompt") then
-                                    prCount += 1
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        -- Also try looking up UserId fallback
-        local ownerPlayer = Players:FindFirstChild(ownerName or "")
-        local userId = garden:GetAttribute("UserId") or (ownerPlayer and ownerPlayer.UserId) or "?"
-        print(string.format("  %s | userId=%s | plants=%d | fruits=%d | prompts=%d | ownerIn=%s | targeted=%s",
-            tostring(ownerName), tostring(userId), pCount, fCount, prCount,
-            tostring(isOwnerInGarden(garden)),
-            tostring(selectedStealTargets[ownerName] == true)
-        ))
-    end
-    Rayfield:Notify({ Title = "Steal Debug", Content = "Check output.", Duration = 3 })
-end })
-
-StealTab:CreateButton({ Name = "Capture Steal Remotes", Callback = function() installCapture(true) end })
-
---==================================================================
--- VISUALS TAB
---==================================================================
-local VisualsTab = Window:CreateTab("Visuals", "eye")
-
-VisualsTab:CreateButton({
-    Name     = "Strip Textures + Particles",
-    Callback = function() task.spawn(stripVisuals) end,
-})
-
-VisualsTab:CreateSection("Info")
--- Labels via paragraphs
-VisualsTab:CreateParagraph({
-    Title   = "What this does",
-    Content = "Removes all decals, textures and SurfaceAppearances. Disables particles, trails, beams, smoke, fire and sparkles. Smooths all BaseParts. Significantly improves FPS.",
-})
-
---==================================================================
--- CONFIG TAB
---==================================================================
-local ConfigTab = Window:CreateTab("Config", "settings")
+-- Config Tab
+win:AddLabel(configTab, "Save / Load Configs")
+local _, getStealHighest, setStealHighest = win:AddToggle(stealTab, "Steal Highest Value First", STEAL_HIGHEST_VALUE, function(v)
+	STEAL_HIGHEST_VALUE = v
+end)
 
 local currentConfigName = DEFAULT_CONFIG_NAME
+local configNameBox
 
-ConfigTab:CreateInput({
-    Name            = "Config Name",
-    PlaceholderText = "default",
-    RemoveTextAfterFocusLost = false,
-    Callback        = function(text)
-        local clean = text:gsub("[^%w_-]", ""):sub(1, 32)
-        currentConfigName = clean ~= "" and clean or DEFAULT_CONFIG_NAME
-    end,
-})
+local refreshConfigList
 
-ConfigTab:CreateButton({ Name = "Save Config", Callback = function()
-    if saveConfig(currentConfigName) then
-        Rayfield:Notify({ Title = "Config", Content = "Saved: " .. currentConfigName, Duration = 3 })
-    end
-end })
+local _, configBox = win:AddTextBox(configTab, "Config Name", "default", function(text)
+	currentConfigName = text:gsub("[^%w_-]", ""):sub(1, 32)
+	if currentConfigName == "" then currentConfigName = DEFAULT_CONFIG_NAME end
+end)
+configNameBox = configBox
+configNameBox.Text = currentConfigName
 
-ConfigTab:CreateButton({ Name = "Load Config", Callback = function()
-    if loadConfig(currentConfigName) then
-        Rayfield:Notify({ Title = "Config", Content = "Loaded: " .. currentConfigName, Duration = 3 })
-    end
-end })
+local function applyLoadedStateToUI()
+	setEnabled(enabled)
+	setAutoSell(AUTO_SELL)
+	setAutoCollect(AUTO_COLLECT)
+	setHidePlots(HIDE_OTHER_PLOTS)
+	setAntiAfk(ANTI_AFK)
+	setAutoPets(AUTO_PETS)
+	setTameTp(TAME_TELEPORT)
+	setAutoSteal(AUTO_STEAL)
+	setSkipLoad(AUTO_SKIP_LOADING)
+	if AUTO_SKIP_LOADING then runAutoSkip() end
+	setAutoBuySeeds(autoBuySeeds)
+	setAutoBuyGear(autoBuyGear)
+	setAutoBuyCrates(autoBuyCrates)
+	buildChecklist(getSeedShopFrame, selectedSeeds, seedRows)
+	buildChecklist(getGearShopFrame, selectedGear, gearRows)
+	buildChecklist(getCrateShopFrame, selectedCrates, crateRows)
+	refreshPetNames()
+    refreshStealTargets()
+	setStealHighest(STEAL_HIGHEST_VALUE)
+	setStayCenter(STAY_IN_CENTER)
+	if stealAmountBox then stealAmountBox.Text = tostring(STEAL_AMOUNT) end
+end
 
-ConfigTab:CreateButton({ Name = "Set as Autoload", Callback = function()
-    ensureConfigFolder()
-    local ok, err = pcall(function() writefile(AUTOLOAD_FILE_PATH, currentConfigName) end)
-    if ok then
-        Rayfield:Notify({ Title = "Config", Content = currentConfigName .. " set as autoload.", Duration = 3 })
-    else
-        Rayfield:Notify({ Title = "Config", Content = "Failed: " .. tostring(err), Duration = 4 })
-    end
-end })
-
-ConfigTab:CreateButton({ Name = "Delete Config", Callback = function()
-    if deleteConfig(currentConfigName) then
-        Rayfield:Notify({ Title = "Config", Content = "Deleted: " .. currentConfigName, Duration = 3 })
-    end
-end })
-
-ConfigTab:CreateButton({ Name = "List Configs (output)", Callback = function()
-    local configs = listConfigs()
-    local msg = #configs > 0 and table.concat(configs, ", ") or "None"
-    print("[Config] Saved configs: " .. msg)
-    Rayfield:Notify({ Title = "Configs", Content = msg, Duration = 6 })
-end })
-
---==================================================================
--- AUTOLOAD ON START
---==================================================================
-pcall(function()
-    local targetConfig = DEFAULT_CONFIG_NAME
-    if isfile and isfile(AUTOLOAD_FILE_PATH) then
-        local saved = readfile(AUTOLOAD_FILE_PATH)
-        if saved and saved ~= "" then targetConfig = saved end
-    end
-    if loadConfig(targetConfig) then
-        currentConfigName = targetConfig
-        Rayfield:Notify({ Title = "Config", Content = "Autoloaded: " .. targetConfig, Duration = 3 })
-    end
+win:AddButton(configTab, "Save Config", function()
+	local name = currentConfigName
+	local success = saveConfig(name)
+	if success then
+		refreshConfigList()
+	end
 end)
 
--- Populate known pets on start
-refreshKnownPetsFromAssets()
-refreshKnownPetsFromWorld()
+win:AddButton(configTab, "Load Config", function()
+	local name = currentConfigName
+	if loadConfig(name) then
+		applyLoadedStateToUI()
+	end
+end)
 
-print("[Garden Hub] Loaded successfully.")
+win:AddButton(configTab, "Set as Autoload", function()
+	ensureConfigFolder()
+	local success, err = pcall(function()
+		writefile(AUTOLOAD_FILE_PATH, currentConfigName)
+	end)
+	if success then
+		print("[Config] '" .. currentConfigName .. "' has been set as the startup config.")
+	else
+		warn("[Config] Failed to set autoload: " .. tostring(err))
+	end
+end)
+
+win:AddButton(configTab, "Delete Config", function()
+	deleteConfig(currentConfigName)
+	refreshConfigList()
+end)
+
+win:AddLabel(configTab, "Saved Configs")
+local configListLabel = win:AddLabel(configTab, "None")
+
+function refreshConfigList()
+	local configs = listConfigs()
+	if #configs == 0 then
+		configListLabel.Text = "NONE"
+	else
+		configListLabel.Text = table.concat(configs, ", ")
+	end
+end
+
+win:AddButton(configTab, "Refresh List", function()
+	refreshConfigList()
+end)
+
+win:AddButton(stealTab, "Debug Steal Targets", function()
+	local nightVal = ReplicatedStorage:FindFirstChild("Night")
+	print("[Debug] Night:", nightVal and tostring(nightVal.Value) or "nil")
+	print("[Debug] Other gardens:", #getOtherGardens())
+	for _, garden in ipairs(getOtherGardens()) do
+		local ownerName = garden:GetAttribute("Owner")
+		local plants = garden:FindFirstChild("Plants")
+		local plantCount = plants and #plants:GetChildren() or 0
+		local fruitCount = 0
+		local promptCount = 0
+		if plants then
+			for _, plant in ipairs(plants:GetChildren()) do
+				local fruits = plant:FindFirstChild("Fruits")
+				if fruits then
+					fruitCount += #fruits:GetChildren()
+					for _, fruit in ipairs(fruits:GetChildren()) do
+						local hp = fruit:FindFirstChild("HarvestPart")
+						if hp then
+							for _, d in ipairs(hp:GetDescendants()) do
+								if d:IsA("ProximityPrompt") and d:HasTag("StealPrompt") then
+									promptCount += 1
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+		print(string.format("  Garden: %s | plants: %d | fruits: %d | stealPrompts: %d | ownerPresent: %s | inTargets: %s",
+			tostring(ownerName), plantCount, fruitCount, promptCount,
+			tostring(isOwnerInGarden(garden)),
+			tostring(selectedStealTargets[ownerName] == true)
+		))
+	end
+end)
+
+local nightLabel = win:AddLabel(stealTab, "Checking night...")
+task.spawn(function()
+	while running do
+		local nightVal = ReplicatedStorage:FindFirstChild("Night")
+		if nightVal then
+			nightLabel.Text = nightVal.Value and "🌙 IT IS NIGHT - STEAL ACTIVE" or "☀ NOT NIGHT - STEAL WONT WORK"
+		end
+		task.wait(2)
+	end
+end)
+
+win:AddButton(stealTab, "Capture Steal Calls", function()
+    for remoteName, remote in pairs(Networking.Steal) do
+        if type(remote) == "table" and type(remote.Fire) == "function" then
+            local orig = remote.Fire
+            remote.Fire = function(self, ...)
+                local args = {...}
+                local parts = {}
+                for i, v in ipairs(args) do
+                    local t = typeof(v)
+                    if t == "Instance" then
+                        parts[i] = string.format("[%d] Instance(%s) = %s", i, v.ClassName, v:GetFullName())
+                    else
+                        parts[i] = string.format("[%d] %s = %s", i, t, tostring(v))
+                    end
+                end
+                print("[STEAL CAPTURE] Steal." .. remoteName .. ":Fire(" .. table.concat(parts, ", ") .. ")")
+                return orig(self, ...)
+            end
+            print("[STEAL CAPTURE] Hooked Steal." .. remoteName)
+        end
+    end
+    print("[STEAL CAPTURE] Now go manually trigger a steal on someone's garden.")
+end)
+
+pcall(function()
+	local targetConfig = DEFAULT_CONFIG_NAME
+	if isfile(AUTOLOAD_FILE_PATH) then
+		local savedTarget = readfile(AUTOLOAD_FILE_PATH)
+		if savedTarget and savedTarget ~= "" then
+			targetConfig = savedTarget
+		end
+	end
+
+	if loadConfig(targetConfig) then
+		applyLoadedStateToUI()
+
+		if configNameBox then
+			configNameBox.Text = targetConfig
+			currentConfigName = targetConfig
+		end
+	end
+end)
+
+refreshConfigList()
